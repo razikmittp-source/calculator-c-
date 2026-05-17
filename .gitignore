@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.c
+*.o
+*.exe
+examples/hello
+examples/fibonacci
+examples/factorial
+examples/arrays
+examples/benchmark
+examples/guessing
+build/
+dist/
+.vscode/
+.idea/
+*.bin
+a.out
