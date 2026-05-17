@@ -801,6 +801,9 @@ static char* _corec_concat(const char* a, const char* b) {
             self.vars[pn] = pt
         
         ret = self._type_to_c(fn.return_type)
+        # main() must always return int in C
+        if fn.name == "main":
+            ret = "int"
         params = ", ".join(f"{self._type_to_c(pt)} {pn}" for pn, pt in fn.params)
         if not params and fn.name == "main":
             params = "void"
