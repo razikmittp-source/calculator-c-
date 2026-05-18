@@ -1,108 +1,49 @@
 #!/usr/bin/env python3
-"""
-CoreC Compiler v0.1 — Transpiles CoreC (.crc) to C, then compiles with gcc.
-CoreC: A fast, clean language that compiles to native code via C.
-"""
-
-import sys
+import argparse
+import io
+import json
 import os
-import subprocess
-import re
-from enum import Enum, auto
+import sys
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ============== LEXER ==============
 
-class TokenType(Enum):
-    # Literals
-    INT_LIT = auto()
-    FLOAT_LIT = auto()
-    STRING_LIT = auto()
-    BOOL_LIT = auto()
-    IDENT = auto()
-    
-    # Keywords
-    FN = auto()
-    LET = auto()
-    MUT = auto()
-    IF = auto()
-    ELSE = auto()
-    FOR = auto()
-    IN = auto()
-    WHILE = auto()
-    RETURN = auto()
-    MATCH = auto()
-    STRUCT = auto()
-    IMPORT = auto()
-    TRUE = auto()
-    FALSE = auto()
-    
-    # Types
-    I32 = auto()
-    I64 = auto()
-    F32 = auto()
-    F64 = auto()
-    BOOL = auto()
-    STR = auto()
-    VOID = auto()
-    
-    # Operators
-    PLUS = auto()
-    MINUS = auto()
-    STAR = auto()
-    SLASH = auto()
-    PERCENT = auto()
-    ASSIGN = auto()
-    EQ = auto()
-    NEQ = auto()
-    LT = auto()
-    GT = auto()
-    LTE = auto()
-    GTE = auto()
-    AND = auto()
-    OR = auto()
-    NOT = auto()
-    PLUSEQ = auto()
-    MINUSEQ = auto()
-    STAREQ = auto()
-    SLASHEQ = auto()
-    
-    # Delimiters
-    LPAREN = auto()
-    RPAREN = auto()
-    LBRACE = auto()
-    RBRACE = auto()
-    LBRACKET = auto()
-    RBRACKET = auto()
-    COMMA = auto()
-    COLON = auto()
-    ARROW = auto()
-    DOT = auto()
-    DOTDOT = auto()
-    
-    # Special
-    NEWLINE = auto()
-    EOF = auto()
-    COMMENT = auto()
+KEYWORDS = {
+    'voice', 'keep', 'perhaps', 'otherwise', 'drown', 'bury', 'fade',
+    'still', 'gone', 'void',
+    'in', 'and', 'or', 'not',
+    'echo', 'memory', 'pain', 'shadow',
+}
+
+TYPE_NAMES = {'echo', 'memory', 'pain', 'shadow', 'void'}
+
 
 @dataclass
 class Token:
-    type: TokenType
-    value: str
+    kind: str
+    value: Any
     line: int
     col: int
 
-KEYWORDS = {
-    'fn': TokenType.FN, 'let': TokenType.LET, 'mut': TokenType.MUT,
-    'if': TokenType.IF, 'else': TokenType.ELSE, 'for': TokenType.FOR,
-    'in': TokenType.IN, 'while': TokenType.WHILE, 'return': TokenType.RETURN,
-    'match': TokenType.MATCH, 'struct': TokenType.STRUCT, 'import': TokenType.IMPORT,
-    'true': TokenType.TRUE, 'false': TokenType.FALSE,
-    'i32': TokenType.I32, 'i64': TokenType.I64, 'f32': TokenType.F32,
-    'f64': TokenType.F64, 'bool': TokenType.BOOL, 'str': TokenType.STR,
-    'void': TokenType.VOID,
-}
+
+class LexError(Exception):
+    pass
+
+
+class ParseError(Exception):
+    pass
+
+
+class SilentFault(Exception):
+    pass
+
+
+class FadeSignal(Exception):
+    def __init__(self, value: Any = None):
+        super().__init__('fade')
+        self.value = value
+
 
 class Lexer:
     def __init__(self, source: str):
@@ -111,13 +52,12 @@ class Lexer:
         self.line = 1
         self.col = 1
         self.tokens: List[Token] = []
-    
-    def peek(self) -> str:
-        if self.pos >= len(self.source):
-            return '\0'
-        return self.source[self.pos]
-    
-    def advance(self) -> str:
+
+    def at(self, offset: int = 0) -> str:
+        i = self.pos + offset
+        return self.source[i] if i < len(self.source) else ''
+
+    def step(self) -> str:
         ch = self.source[self.pos]
         self.pos += 1
         if ch == '\n':
@@ -126,1100 +66,996 @@ class Lexer:
         else:
             self.col += 1
         return ch
-    
-    def match(self, expected: str) -> bool:
-        if self.pos < len(self.source) and self.source[self.pos] == expected:
-            self.advance()
-            return True
-        return False
-    
+
     def tokenize(self) -> List[Token]:
         while self.pos < len(self.source):
-            ch = self.peek()
-            
-            # Whitespace (not newline)
+            ch = self.at()
             if ch in ' \t\r':
-                self.advance()
+                self.step()
                 continue
-            
-            # Newline
             if ch == '\n':
-                self.advance()
-                if self.tokens and self.tokens[-1].type != TokenType.NEWLINE:
-                    self.tokens.append(Token(TokenType.NEWLINE, '\\n', self.line - 1, self.col))
+                line, col = self.line, self.col
+                self.step()
+                if self.tokens and self.tokens[-1].kind != 'NEWLINE':
+                    self.tokens.append(Token('NEWLINE', '\\n', line, col))
                 continue
-            
-            # Comments
-            if ch == '/' and self.pos + 1 < len(self.source) and self.source[self.pos + 1] == '/':
-                while self.pos < len(self.source) and self.peek() != '\n':
-                    self.advance()
+            if ch == '~' and self.at(1) == '~':
+                while self.pos < len(self.source) and self.at() != '\n':
+                    self.step()
                 continue
-            
-            start_line, start_col = self.line, self.col
-            
-            # Numbers
+            line, col = self.line, self.col
             if ch.isdigit():
-                self._read_number(start_line, start_col)
+                self._number(line, col)
                 continue
-            
-            # Strings
             if ch == '"':
-                self._read_string(start_line, start_col)
+                self._string(line, col)
                 continue
-            
-            # Identifiers / Keywords
             if ch.isalpha() or ch == '_':
-                self._read_ident(start_line, start_col)
+                self._ident(line, col)
                 continue
-            
-            # Operators and delimiters
-            self.advance()
-            if ch == '+':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.PLUSEQ, '+=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.PLUS, '+', start_line, start_col))
-            elif ch == '-':
-                if self.match('>'):
-                    self.tokens.append(Token(TokenType.ARROW, '->', start_line, start_col))
-                elif self.match('='):
-                    self.tokens.append(Token(TokenType.MINUSEQ, '-=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.MINUS, '-', start_line, start_col))
-            elif ch == '*':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.STAREQ, '*=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.STAR, '*', start_line, start_col))
-            elif ch == '/':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.SLASHEQ, '/=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.SLASH, '/', start_line, start_col))
-            elif ch == '%':
-                self.tokens.append(Token(TokenType.PERCENT, '%', start_line, start_col))
-            elif ch == '=':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.EQ, '==', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.ASSIGN, '=', start_line, start_col))
-            elif ch == '!':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.NEQ, '!=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.NOT, '!', start_line, start_col))
-            elif ch == '<':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.LTE, '<=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.LT, '<', start_line, start_col))
-            elif ch == '>':
-                if self.match('='):
-                    self.tokens.append(Token(TokenType.GTE, '>=', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.GT, '>', start_line, start_col))
-            elif ch == '&':
-                self.match('&')
-                self.tokens.append(Token(TokenType.AND, '&&', start_line, start_col))
-            elif ch == '|':
-                self.match('|')
-                self.tokens.append(Token(TokenType.OR, '||', start_line, start_col))
-            elif ch == '(':
-                self.tokens.append(Token(TokenType.LPAREN, '(', start_line, start_col))
-            elif ch == ')':
-                self.tokens.append(Token(TokenType.RPAREN, ')', start_line, start_col))
-            elif ch == '{':
-                self.tokens.append(Token(TokenType.LBRACE, '{', start_line, start_col))
-            elif ch == '}':
-                self.tokens.append(Token(TokenType.RBRACE, '}', start_line, start_col))
-            elif ch == '[':
-                self.tokens.append(Token(TokenType.LBRACKET, '[', start_line, start_col))
-            elif ch == ']':
-                self.tokens.append(Token(TokenType.RBRACKET, ']', start_line, start_col))
-            elif ch == ',':
-                self.tokens.append(Token(TokenType.COMMA, ',', start_line, start_col))
-            elif ch == ':':
-                self.tokens.append(Token(TokenType.COLON, ':', start_line, start_col))
-            elif ch == '.':
-                if self.match('.'):
-                    self.tokens.append(Token(TokenType.DOTDOT, '..', start_line, start_col))
-                else:
-                    self.tokens.append(Token(TokenType.DOT, '.', start_line, start_col))
-            else:
-                raise SyntaxError(f"Unexpected character '{ch}' at line {start_line}:{start_col}")
-        
-        self.tokens.append(Token(TokenType.EOF, '', self.line, self.col))
+            self._operator(line, col)
+        if not self.tokens or self.tokens[-1].kind != 'NEWLINE':
+            self.tokens.append(Token('NEWLINE', '\\n', self.line, self.col))
+        self.tokens.append(Token('EOF', '', self.line, self.col))
         return self.tokens
-    
-    def _read_number(self, line, col):
+
+    def _number(self, line: int, col: int) -> None:
         start = self.pos
         is_float = False
-        while self.pos < len(self.source) and (self.peek().isdigit() or self.peek() == '.'):
-            if self.peek() == '.':
-                # Don't consume '.' if next is also '.' (range operator ..)
-                if self.pos + 1 < len(self.source) and self.source[self.pos + 1] == '.':
-                    break
+        while self.pos < len(self.source):
+            c = self.at()
+            if c == '.' and self.at(1) == '.':
+                break
+            if c == '.':
                 if is_float:
                     break
                 is_float = True
-            self.advance()
-        value = self.source[start:self.pos]
+                self.step()
+                continue
+            if c.isdigit():
+                self.step()
+                continue
+            break
+        text = self.source[start:self.pos]
         if is_float:
-            self.tokens.append(Token(TokenType.FLOAT_LIT, value, line, col))
+            self.tokens.append(Token('NUMBER', float(text), line, col))
         else:
-            self.tokens.append(Token(TokenType.INT_LIT, value, line, col))
-    
-    def _read_string(self, line, col):
-        self.advance()  # skip opening "
-        start = self.pos
-        while self.pos < len(self.source) and self.peek() != '"':
-            if self.peek() == '\\':
-                self.advance()
-            self.advance()
-        value = self.source[start:self.pos]
-        self.advance()  # skip closing "
-        self.tokens.append(Token(TokenType.STRING_LIT, value, line, col))
-    
-    def _read_ident(self, line, col):
-        start = self.pos
-        while self.pos < len(self.source) and (self.peek().isalnum() or self.peek() == '_'):
-            self.advance()
-        value = self.source[start:self.pos]
-        token_type = KEYWORDS.get(value, TokenType.IDENT)
-        self.tokens.append(Token(token_type, value, line, col))
+            self.tokens.append(Token('NUMBER', int(text), line, col))
 
+    def _string(self, line: int, col: int) -> None:
+        self.step()
+        parts: List[Any] = ['']
+        while self.pos < len(self.source) and self.at() != '"':
+            c = self.at()
+            if c == '\\' and self.pos + 1 < len(self.source):
+                self.step()
+                esc = self.step()
+                mapping = {'n': '\n', 't': '\t', 'r': '\r', '"': '"', '\\': '\\', '{': '{', '}': '}'}
+                parts[-1] += mapping.get(esc, esc)
+                continue
+            if c == '{':
+                self.step()
+                name = ''
+                while self.pos < len(self.source) and self.at() != '}':
+                    name += self.step()
+                if self.pos < len(self.source):
+                    self.step()
+                parts.append(('var', name.strip()))
+                parts.append('')
+                continue
+            parts[-1] += self.step()
+        if self.pos >= len(self.source):
+            raise LexError(f"unfinished string at line {line}")
+        self.step()
+        self.tokens.append(Token('STRING', parts, line, col))
 
-# ============== AST ==============
+    def _ident(self, line: int, col: int) -> None:
+        start = self.pos
+        while self.pos < len(self.source) and (self.at().isalnum() or self.at() == '_'):
+            self.step()
+        text = self.source[start:self.pos]
+        if text in KEYWORDS:
+            self.tokens.append(Token('KEYWORD', text, line, col))
+        else:
+            self.tokens.append(Token('IDENT', text, line, col))
+
+    def _operator(self, line: int, col: int) -> None:
+        ch = self.step()
+        two = ch + self.at()
+        if two in ('==', '!=', '<=', '>=', '->', '..'):
+            self.step()
+            kind = {
+                '==': 'OP', '!=': 'OP', '<=': 'OP', '>=': 'OP',
+                '->': 'ARROW', '..': 'RANGE',
+            }[two]
+            self.tokens.append(Token(kind, two, line, col))
+            return
+        single_map = {
+            '+': 'OP', '-': 'OP', '*': 'OP', '/': 'OP', '%': 'OP',
+            '<': 'OP', '>': 'OP', '=': 'ASSIGN',
+            '(': 'LPAREN', ')': 'RPAREN',
+            '{': 'LBRACE', '}': 'RBRACE',
+            '[': 'LBRACK', ']': 'RBRACK',
+            ',': 'COMMA', ':': 'COLON',
+        }
+        if ch in single_map:
+            self.tokens.append(Token(single_map[ch], ch, line, col))
+            return
+        raise LexError(f"strange mark '{ch}' at line {line}:{col}")
+
 
 @dataclass
-class ASTNode:
+class Node:
     line: int = 0
 
-@dataclass
-class Program(ASTNode):
-    functions: List['Function'] = field(default_factory=list)
-    structs: List['StructDef'] = field(default_factory=list)
 
 @dataclass
-class Function(ASTNode):
-    name: str = ""
-    params: List[Tuple[str, str]] = field(default_factory=list)  # (name, type)
-    return_type: str = "void"
-    body: List[ASTNode] = field(default_factory=list)
+class Program(Node):
+    body: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class StructDef(ASTNode):
-    name: str = ""
-    fields: List[Tuple[str, str]] = field(default_factory=list)
+class FuncDef(Node):
+    name: str = ''
+    params: List[Tuple[str, Optional[str]]] = field(default_factory=list)
+    return_type: Optional[str] = None
+    body: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class VarDecl(ASTNode):
-    name: str = ""
+class VarDecl(Node):
+    name: str = ''
     type_hint: Optional[str] = None
-    value: Optional[ASTNode] = None
-    mutable: bool = False
+    value: Optional[Node] = None
+
 
 @dataclass
-class Assignment(ASTNode):
-    target: str = ""
-    op: str = "="
-    value: Optional[ASTNode] = None
+class Assign(Node):
+    target: Optional[Node] = None
+    value: Optional[Node] = None
+
 
 @dataclass
-class IfStmt(ASTNode):
-    condition: Optional[ASTNode] = None
-    then_body: List[ASTNode] = field(default_factory=list)
-    else_body: List[ASTNode] = field(default_factory=list)
+class IfStmt(Node):
+    cond: Optional[Node] = None
+    then_body: List[Node] = field(default_factory=list)
+    else_body: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class ForStmt(ASTNode):
-    var: str = ""
-    iterable: Optional[ASTNode] = None
-    body: List[ASTNode] = field(default_factory=list)
+class WhileStmt(Node):
+    cond: Optional[Node] = None
+    body: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class WhileStmt(ASTNode):
-    condition: Optional[ASTNode] = None
-    body: List[ASTNode] = field(default_factory=list)
+class ForStmt(Node):
+    var: str = ''
+    iterable: Optional[Node] = None
+    body: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class ReturnStmt(ASTNode):
-    value: Optional[ASTNode] = None
+class FadeStmt(Node):
+    value: Optional[Node] = None
+
 
 @dataclass
-class FuncCall(ASTNode):
-    name: str = ""
-    args: List[ASTNode] = field(default_factory=list)
+class ExprStmt(Node):
+    value: Optional[Node] = None
+
 
 @dataclass
-class BinaryOp(ASTNode):
-    left: Optional[ASTNode] = None
-    op: str = ""
-    right: Optional[ASTNode] = None
+class Binary(Node):
+    op: str = ''
+    left: Optional[Node] = None
+    right: Optional[Node] = None
+
 
 @dataclass
-class UnaryOp(ASTNode):
-    op: str = ""
-    operand: Optional[ASTNode] = None
+class Unary(Node):
+    op: str = ''
+    operand: Optional[Node] = None
+
 
 @dataclass
-class IntLit(ASTNode):
-    value: int = 0
+class Call(Node):
+    callee: Optional[Node] = None
+    args: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class FloatLit(ASTNode):
-    value: float = 0.0
+class Index(Node):
+    target: Optional[Node] = None
+    index: Optional[Node] = None
+
 
 @dataclass
-class StringLit(ASTNode):
-    value: str = ""
-    interpolations: List[Tuple[int, str]] = field(default_factory=list)
+class Name(Node):
+    text: str = ''
+
 
 @dataclass
-class BoolLit(ASTNode):
+class NumberLit(Node):
+    value: Any = 0
+
+
+@dataclass
+class StringLit(Node):
+    parts: List[Any] = field(default_factory=list)
+
+
+@dataclass
+class BoolLit(Node):
     value: bool = False
 
-@dataclass
-class Identifier(ASTNode):
-    name: str = ""
 
 @dataclass
-class ArrayLit(ASTNode):
-    elements: List[ASTNode] = field(default_factory=list)
+class VoidLit(Node):
+    pass
+
 
 @dataclass
-class IndexAccess(ASTNode):
-    array: Optional[ASTNode] = None
-    index: Optional[ASTNode] = None
+class ArrayLit(Node):
+    items: List[Node] = field(default_factory=list)
+
 
 @dataclass
-class RangeExpr(ASTNode):
-    start: Optional[ASTNode] = None
-    end: Optional[ASTNode] = None
+class RangeLit(Node):
+    start: Optional[Node] = None
+    end: Optional[Node] = None
 
-
-# ============== PARSER ==============
 
 class Parser:
     def __init__(self, tokens: List[Token]):
-        self.tokens = [t for t in tokens if t.type != TokenType.NEWLINE or True]
+        self.tokens = tokens
         self.pos = 0
-    
-    def peek(self) -> Token:
+
+    def at(self) -> Token:
         return self.tokens[self.pos]
-    
-    def advance(self) -> Token:
+
+    def peek(self, offset: int = 0) -> Token:
+        i = self.pos + offset
+        return self.tokens[i] if i < len(self.tokens) else self.tokens[-1]
+
+    def eat(self) -> Token:
         t = self.tokens[self.pos]
         self.pos += 1
         return t
-    
-    def expect(self, tt: TokenType) -> Token:
-        t = self.advance()
-        if t.type != tt:
-            raise SyntaxError(f"Expected {tt.name}, got {t.type.name} ('{t.value}') at line {t.line}:{t.col}")
-        return t
-    
-    def skip_newlines(self):
-        while self.peek().type == TokenType.NEWLINE:
-            self.advance()
-    
+
+    def check(self, kind: str, value: Any = None) -> bool:
+        t = self.at()
+        if t.kind != kind:
+            return False
+        if value is not None and t.value != value:
+            return False
+        return True
+
+    def accept(self, kind: str, value: Any = None) -> Optional[Token]:
+        if self.check(kind, value):
+            return self.eat()
+        return None
+
+    def expect(self, kind: str, value: Any = None) -> Token:
+        t = self.at()
+        if not self.check(kind, value):
+            want = value if value is not None else kind
+            raise ParseError(f"line {t.line}: wanted {want}, found '{t.value}'")
+        return self.eat()
+
+    def skip_breaks(self) -> None:
+        while self.check('NEWLINE'):
+            self.eat()
+
     def parse(self) -> Program:
         prog = Program()
-        self.skip_newlines()
-        while self.peek().type != TokenType.EOF:
-            if self.peek().type == TokenType.FN:
-                prog.functions.append(self.parse_function())
-            elif self.peek().type == TokenType.STRUCT:
-                prog.structs.append(self.parse_struct())
-            else:
-                raise SyntaxError(f"Unexpected token {self.peek().value} at line {self.peek().line}")
-            self.skip_newlines()
+        self.skip_breaks()
+        while not self.check('EOF'):
+            prog.body.append(self.top_level())
+            self.skip_breaks()
         return prog
-    
-    def parse_struct(self) -> StructDef:
-        self.advance()  # struct
-        name = self.expect(TokenType.IDENT).value
-        self.expect(TokenType.LBRACE)
-        self.skip_newlines()
-        fields = []
-        while self.peek().type != TokenType.RBRACE:
-            fname = self.expect(TokenType.IDENT).value
-            self.expect(TokenType.COLON)
-            ftype = self.parse_type()
-            fields.append((fname, ftype))
-            self.skip_newlines()
-        self.expect(TokenType.RBRACE)
-        return StructDef(name=name, fields=fields)
-    
-    def parse_function(self) -> Function:
-        self.advance()  # fn
-        name = self.expect(TokenType.IDENT).value
-        self.expect(TokenType.LPAREN)
-        params = []
-        while self.peek().type != TokenType.RPAREN:
-            pname = self.expect(TokenType.IDENT).value
-            self.expect(TokenType.COLON)
-            ptype = self.parse_type()
+
+    def top_level(self) -> Node:
+        if self.check('KEYWORD', 'voice'):
+            return self.func_def()
+        return self.statement()
+
+    def func_def(self) -> FuncDef:
+        line = self.at().line
+        self.expect('KEYWORD', 'voice')
+        name = self.expect('IDENT').value
+        self.expect('LPAREN')
+        params: List[Tuple[str, Optional[str]]] = []
+        while not self.check('RPAREN'):
+            pname = self.expect('IDENT').value
+            ptype: Optional[str] = None
+            if self.accept('COLON'):
+                ptype = self.parse_type()
             params.append((pname, ptype))
-            if self.peek().type == TokenType.COMMA:
-                self.advance()
-        self.expect(TokenType.RPAREN)
-        
-        ret_type = "void"
-        if self.peek().type == TokenType.ARROW:
-            self.advance()
-            ret_type = self.parse_type()
-        
-        body = self.parse_block()
-        return Function(name=name, params=params, return_type=ret_type, body=body)
-    
-    def parse_type(self) -> str:
-        t = self.advance()
-        if t.type in (TokenType.I32, TokenType.I64, TokenType.F32, TokenType.F64,
-                      TokenType.BOOL, TokenType.STR, TokenType.VOID):
-            return t.value
-        elif t.type == TokenType.IDENT:
-            return t.value
-        elif t.type == TokenType.LBRACKET:
-            inner = self.parse_type()
-            self.expect(TokenType.RBRACKET)
-            return f"[]{inner}"
-        raise SyntaxError(f"Expected type, got {t.value} at line {t.line}")
-    
-    def parse_block(self) -> List[ASTNode]:
-        self.skip_newlines()
-        self.expect(TokenType.LBRACE)
-        self.skip_newlines()
-        stmts = []
-        while self.peek().type != TokenType.RBRACE:
-            stmts.append(self.parse_statement())
-            self.skip_newlines()
-        self.expect(TokenType.RBRACE)
-        return stmts
-    
-    def parse_statement(self) -> ASTNode:
-        self.skip_newlines()
-        t = self.peek()
-        
-        if t.type == TokenType.LET:
-            return self.parse_var_decl()
-        elif t.type == TokenType.IF:
-            return self.parse_if()
-        elif t.type == TokenType.FOR:
-            return self.parse_for()
-        elif t.type == TokenType.WHILE:
-            return self.parse_while()
-        elif t.type == TokenType.RETURN:
-            return self.parse_return()
-        elif t.type == TokenType.IDENT:
-            return self.parse_expr_or_assign()
-        else:
-            return self.parse_expr()
-    
-    def parse_var_decl(self) -> VarDecl:
-        self.advance()  # let
-        mutable = False
-        if self.peek().type == TokenType.MUT:
-            mutable = True
-            self.advance()
-        name = self.expect(TokenType.IDENT).value
-        type_hint = None
-        if self.peek().type == TokenType.COLON:
-            self.advance()
-            type_hint = self.parse_type()
-        value = None
-        if self.peek().type == TokenType.ASSIGN:
-            self.advance()
-            value = self.parse_expr()
-        return VarDecl(name=name, type_hint=type_hint, value=value, mutable=mutable)
-    
-    def parse_if(self) -> IfStmt:
-        self.advance()  # if
-        cond = self.parse_expr()
-        then_body = self.parse_block()
-        else_body = []
-        self.skip_newlines()
-        if self.peek().type == TokenType.ELSE:
-            self.advance()
-            if self.peek().type == TokenType.IF:
-                else_body = [self.parse_if()]
-            else:
-                else_body = self.parse_block()
-        return IfStmt(condition=cond, then_body=then_body, else_body=else_body)
-    
-    def parse_for(self) -> ForStmt:
-        self.advance()  # for
-        var = self.expect(TokenType.IDENT).value
-        self.expect(TokenType.IN)
-        iterable = self.parse_expr()
-        body = self.parse_block()
-        return ForStmt(var=var, iterable=iterable, body=body)
-    
-    def parse_while(self) -> WhileStmt:
-        self.advance()  # while
-        cond = self.parse_expr()
-        body = self.parse_block()
-        return WhileStmt(condition=cond, body=body)
-    
-    def parse_return(self) -> ReturnStmt:
-        self.advance()  # return
-        value = None
-        if self.peek().type not in (TokenType.NEWLINE, TokenType.RBRACE, TokenType.EOF):
-            value = self.parse_expr()
-        return ReturnStmt(value=value)
-    
-    def parse_expr_or_assign(self) -> ASTNode:
-        # Could be assignment (x = ..., x += ...) or expression (func call)
-        save = self.pos
-        name = self.advance().value  # IDENT
-        
-        if self.peek().type in (TokenType.ASSIGN, TokenType.PLUSEQ, TokenType.MINUSEQ,
-                                TokenType.STAREQ, TokenType.SLASHEQ):
-            op = self.advance().value
-            value = self.parse_expr()
-            return Assignment(target=name, op=op, value=value)
-        
-        # Not assignment, backtrack and parse as expression
-        self.pos = save
-        return self.parse_expr()
-    
-    def parse_expr(self) -> ASTNode:
-        return self.parse_or()
-    
-    def parse_or(self) -> ASTNode:
-        left = self.parse_and()
-        while self.peek().type == TokenType.OR:
-            op = self.advance().value
-            right = self.parse_and()
-            left = BinaryOp(left=left, op=op, right=right)
-        return left
-    
-    def parse_and(self) -> ASTNode:
-        left = self.parse_comparison()
-        while self.peek().type == TokenType.AND:
-            op = self.advance().value
-            right = self.parse_comparison()
-            left = BinaryOp(left=left, op=op, right=right)
-        return left
-    
-    def parse_comparison(self) -> ASTNode:
-        left = self.parse_addition()
-        while self.peek().type in (TokenType.EQ, TokenType.NEQ, TokenType.LT,
-                                   TokenType.GT, TokenType.LTE, TokenType.GTE):
-            op = self.advance().value
-            right = self.parse_addition()
-            left = BinaryOp(left=left, op=op, right=right)
-        return left
-    
-    def parse_addition(self) -> ASTNode:
-        left = self.parse_multiplication()
-        while self.peek().type in (TokenType.PLUS, TokenType.MINUS):
-            op = self.advance().value
-            right = self.parse_multiplication()
-            left = BinaryOp(left=left, op=op, right=right)
-        return left
-    
-    def parse_multiplication(self) -> ASTNode:
-        left = self.parse_unary()
-        while self.peek().type in (TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
-            op = self.advance().value
-            right = self.parse_unary()
-            left = BinaryOp(left=left, op=op, right=right)
-        return left
-    
-    def parse_unary(self) -> ASTNode:
-        if self.peek().type in (TokenType.MINUS, TokenType.NOT):
-            op = self.advance().value
-            operand = self.parse_unary()
-            return UnaryOp(op=op, operand=operand)
-        return self.parse_postfix()
-    
-    def parse_postfix(self) -> ASTNode:
-        node = self.parse_primary()
-        while True:
-            if self.peek().type == TokenType.LBRACKET:
-                self.advance()
-                index = self.parse_expr()
-                self.expect(TokenType.RBRACKET)
-                node = IndexAccess(array=node, index=index)
-            elif self.peek().type == TokenType.LPAREN and isinstance(node, Identifier):
-                self.advance()
-                args = []
-                while self.peek().type != TokenType.RPAREN:
-                    args.append(self.parse_expr())
-                    if self.peek().type == TokenType.COMMA:
-                        self.advance()
-                self.expect(TokenType.RPAREN)
-                node = FuncCall(name=node.name, args=args)
-            elif self.peek().type == TokenType.DOT:
-                self.advance()
-                field = self.expect(TokenType.IDENT).value
-                node = BinaryOp(left=node, op='.', right=Identifier(name=field))
-            else:
+            if not self.accept('COMMA'):
                 break
+        self.expect('RPAREN')
+        ret: Optional[str] = None
+        if self.accept('ARROW'):
+            ret = self.parse_type()
+        body = self.block()
+        return FuncDef(line=line, name=name, params=params, return_type=ret, body=body)
+
+    def parse_type(self) -> str:
+        t = self.at()
+        if t.kind == 'KEYWORD' and t.value in TYPE_NAMES:
+            self.eat()
+            return t.value
+        if t.kind == 'IDENT':
+            self.eat()
+            return t.value
+        raise ParseError(f"line {t.line}: expected a type, found '{t.value}'")
+
+    def block(self) -> List[Node]:
+        self.skip_breaks()
+        self.expect('LBRACE')
+        self.skip_breaks()
+        stmts: List[Node] = []
+        while not self.check('RBRACE') and not self.check('EOF'):
+            stmts.append(self.statement())
+            self.skip_breaks()
+        self.expect('RBRACE')
+        return stmts
+
+    def statement(self) -> Node:
+        t = self.at()
+        if t.kind == 'KEYWORD':
+            if t.value == 'keep':
+                return self.var_decl()
+            if t.value == 'perhaps':
+                return self.if_stmt()
+            if t.value == 'drown':
+                return self.while_stmt()
+            if t.value == 'bury':
+                return self.for_stmt()
+            if t.value == 'fade':
+                return self.fade_stmt()
+            if t.value == 'voice':
+                return self.func_def()
+        return self.expr_or_assign()
+
+    def var_decl(self) -> VarDecl:
+        line = self.at().line
+        self.expect('KEYWORD', 'keep')
+        name = self.expect('IDENT').value
+        type_hint: Optional[str] = None
+        if self.accept('COLON'):
+            type_hint = self.parse_type()
+        value: Optional[Node] = None
+        if self.accept('ASSIGN'):
+            value = self.expression()
+        return VarDecl(line=line, name=name, type_hint=type_hint, value=value)
+
+    def if_stmt(self) -> IfStmt:
+        line = self.at().line
+        self.expect('KEYWORD', 'perhaps')
+        cond = self.expression()
+        then_body = self.block()
+        else_body: List[Node] = []
+        self.skip_breaks()
+        if self.accept('KEYWORD', 'otherwise'):
+            if self.check('KEYWORD', 'perhaps'):
+                else_body = [self.if_stmt()]
+            else:
+                else_body = self.block()
+        return IfStmt(line=line, cond=cond, then_body=then_body, else_body=else_body)
+
+    def while_stmt(self) -> WhileStmt:
+        line = self.at().line
+        self.expect('KEYWORD', 'drown')
+        cond = self.expression()
+        body = self.block()
+        return WhileStmt(line=line, cond=cond, body=body)
+
+    def for_stmt(self) -> ForStmt:
+        line = self.at().line
+        self.expect('KEYWORD', 'bury')
+        var = self.expect('IDENT').value
+        self.expect('KEYWORD', 'in')
+        iterable = self.expression()
+        body = self.block()
+        return ForStmt(line=line, var=var, iterable=iterable, body=body)
+
+    def fade_stmt(self) -> FadeStmt:
+        line = self.at().line
+        self.expect('KEYWORD', 'fade')
+        value: Optional[Node] = None
+        if not self.check('NEWLINE') and not self.check('RBRACE') and not self.check('EOF'):
+            value = self.expression()
+        return FadeStmt(line=line, value=value)
+
+    def expr_or_assign(self) -> Node:
+        line = self.at().line
+        target = self.expression()
+        if self.accept('ASSIGN'):
+            value = self.expression()
+            return Assign(line=line, target=target, value=value)
+        return ExprStmt(line=line, value=target)
+
+    def expression(self) -> Node:
+        return self.range_expr()
+
+    def range_expr(self) -> Node:
+        left = self.logic_or()
+        if self.accept('RANGE'):
+            right = self.logic_or()
+            return RangeLit(line=left.line, start=left, end=right)
+        return left
+
+    def logic_or(self) -> Node:
+        left = self.logic_and()
+        while self.check('KEYWORD', 'or'):
+            self.eat()
+            right = self.logic_and()
+            left = Binary(line=left.line, op='or', left=left, right=right)
+        return left
+
+    def logic_and(self) -> Node:
+        left = self.logic_not()
+        while self.check('KEYWORD', 'and'):
+            self.eat()
+            right = self.logic_not()
+            left = Binary(line=left.line, op='and', left=left, right=right)
+        return left
+
+    def logic_not(self) -> Node:
+        if self.check('KEYWORD', 'not'):
+            line = self.at().line
+            self.eat()
+            operand = self.logic_not()
+            return Unary(line=line, op='not', operand=operand)
+        return self.comparison()
+
+    def comparison(self) -> Node:
+        left = self.addition()
+        while self.at().kind == 'OP' and self.at().value in ('==', '!=', '<', '>', '<=', '>='):
+            op = self.eat().value
+            right = self.addition()
+            left = Binary(line=left.line, op=op, left=left, right=right)
+        return left
+
+    def addition(self) -> Node:
+        left = self.multiplication()
+        while self.at().kind == 'OP' and self.at().value in ('+', '-'):
+            op = self.eat().value
+            right = self.multiplication()
+            left = Binary(line=left.line, op=op, left=left, right=right)
+        return left
+
+    def multiplication(self) -> Node:
+        left = self.unary()
+        while self.at().kind == 'OP' and self.at().value in ('*', '/', '%'):
+            op = self.eat().value
+            right = self.unary()
+            left = Binary(line=left.line, op=op, left=left, right=right)
+        return left
+
+    def unary(self) -> Node:
+        if self.at().kind == 'OP' and self.at().value == '-':
+            line = self.at().line
+            self.eat()
+            operand = self.unary()
+            return Unary(line=line, op='-', operand=operand)
+        return self.postfix()
+
+    def postfix(self) -> Node:
+        node = self.primary()
+        while True:
+            if self.accept('LPAREN'):
+                args: List[Node] = []
+                while not self.check('RPAREN'):
+                    args.append(self.expression())
+                    if not self.accept('COMMA'):
+                        break
+                self.expect('RPAREN')
+                node = Call(line=node.line, callee=node, args=args)
+                continue
+            if self.accept('LBRACK'):
+                idx = self.expression()
+                self.expect('RBRACK')
+                node = Index(line=node.line, target=node, index=idx)
+                continue
+            break
         return node
-    
-    def parse_primary(self) -> ASTNode:
-        t = self.peek()
-        
-        if t.type == TokenType.INT_LIT:
-            self.advance()
-            return IntLit(value=int(t.value))
-        elif t.type == TokenType.FLOAT_LIT:
-            self.advance()
-            return FloatLit(value=float(t.value))
-        elif t.type == TokenType.STRING_LIT:
-            self.advance()
-            return StringLit(value=t.value)
-        elif t.type in (TokenType.TRUE, TokenType.FALSE):
-            self.advance()
-            return BoolLit(value=(t.type == TokenType.TRUE))
-        elif t.type == TokenType.IDENT:
-            self.advance()
-            return Identifier(name=t.value)
-        elif t.type == TokenType.LBRACKET:
-            return self.parse_array_lit()
-        elif t.type == TokenType.LPAREN:
-            self.advance()
-            expr = self.parse_expr()
-            self.expect(TokenType.RPAREN)
+
+    def primary(self) -> Node:
+        t = self.at()
+        if t.kind == 'NUMBER':
+            self.eat()
+            return NumberLit(line=t.line, value=t.value)
+        if t.kind == 'STRING':
+            self.eat()
+            return StringLit(line=t.line, parts=t.value)
+        if t.kind == 'KEYWORD' and t.value == 'still':
+            self.eat()
+            return BoolLit(line=t.line, value=True)
+        if t.kind == 'KEYWORD' and t.value == 'gone':
+            self.eat()
+            return BoolLit(line=t.line, value=False)
+        if t.kind == 'KEYWORD' and t.value == 'void':
+            self.eat()
+            return VoidLit(line=t.line)
+        if t.kind == 'IDENT':
+            self.eat()
+            return Name(line=t.line, text=t.value)
+        if t.kind == 'LPAREN':
+            self.eat()
+            expr = self.expression()
+            self.expect('RPAREN')
             return expr
-        elif t.type == TokenType.MINUS:
-            self.advance()
-            operand = self.parse_primary()
-            return UnaryOp(op='-', operand=operand)
-        
-        raise SyntaxError(f"Unexpected token '{t.value}' ({t.type.name}) at line {t.line}:{t.col}")
-    
-    def parse_array_lit(self) -> ASTNode:
-        self.advance()  # [
-        elements = []
-        while self.peek().type != TokenType.RBRACKET:
-            el = self.parse_expr()
-            # Check for range
-            if self.peek().type == TokenType.DOTDOT:
-                self.advance()
-                end = self.parse_expr()
-                self.expect(TokenType.RBRACKET)
-                return RangeExpr(start=el, end=end)
-            elements.append(el)
-            if self.peek().type == TokenType.COMMA:
-                self.advance()
-        self.expect(TokenType.RBRACKET)
-        return ArrayLit(elements=elements)
+        if t.kind == 'LBRACK':
+            self.eat()
+            items: List[Node] = []
+            self.skip_breaks()
+            while not self.check('RBRACK'):
+                items.append(self.expression())
+                self.skip_breaks()
+                if not self.accept('COMMA'):
+                    break
+                self.skip_breaks()
+            self.expect('RBRACK')
+            return ArrayLit(line=t.line, items=items)
+        raise ParseError(f"line {t.line}: unexpected '{t.value}'")
 
 
-# ============== CODE GENERATOR ==============
+class Environment:
+    def __init__(self, parent: Optional['Environment'] = None):
+        self.values: Dict[str, Any] = {}
+        self.parent = parent
 
-class CodeGen:
-    def __init__(self):
-        self.output = []
-        self.indent = 0
-        self.vars = {}  # name -> type
-        self.functions = {}  # name -> return_type
-        self.includes = set()
-        self.string_helpers_needed = False
-    
-    def emit(self, line: str):
-        self.output.append("    " * self.indent + line)
-    
-    def generate(self, program: Program) -> str:
-        # First pass: collect function signatures
-        for fn in program.functions:
-            self.functions[fn.name] = fn.return_type
-        
-        # Generate functions
-        func_code = []
-        for fn in program.functions:
-            func_code.append(self._gen_function(fn))
-        
-        # Build final output
-        self.includes.add("#include <stdio.h>")
-        self.includes.add("#include <stdlib.h>")
-        self.includes.add("#include <string.h>")
-        self.includes.add("#include <stdbool.h>")
-        
-        header = "// Generated by CoreC Compiler v0.1\n"
-        header += "// https://github.com/corec-lang/corec\n\n"
-        header += "\n".join(sorted(self.includes)) + "\n\n"
-        
-        if self.string_helpers_needed:
-            header += self._string_helpers() + "\n\n"
-        
-        # Struct definitions
-        for s in program.structs:
-            header += self._gen_struct(s) + "\n\n"
-        
-        # Forward declarations
-        for fn in program.functions:
-            if fn.name != "main":
-                header += self._gen_func_decl(fn) + ";\n"
-        if program.functions:
-            header += "\n"
-        
-        return header + "\n".join(func_code)
-    
-    def _string_helpers(self) -> str:
-        return """// CoreC string interpolation helper
-static char* _corec_fmt_int(int v) {
-    char* buf = malloc(32);
-    snprintf(buf, 32, "%d", v);
-    return buf;
-}
-static char* _corec_fmt_float(double v) {
-    char* buf = malloc(64);
-    snprintf(buf, 64, "%g", v);
-    return buf;
-}
-static char* _corec_concat(const char* a, const char* b) {
-    size_t la = strlen(a), lb = strlen(b);
-    char* r = malloc(la + lb + 1);
-    memcpy(r, a, la);
-    memcpy(r + la, b, lb + 1);
-    return r;
-}"""
-    
-    def _gen_struct(self, s: StructDef) -> str:
-        lines = [f"typedef struct {{"]
-        for fname, ftype in s.fields:
-            lines.append(f"    {self._type_to_c(ftype)} {fname};")
-        lines.append(f"}} {s.name};")
-        return "\n".join(lines)
-    
-    def _gen_func_decl(self, fn: Function) -> str:
-        ret = self._type_to_c(fn.return_type)
-        params = ", ".join(f"{self._type_to_c(pt)} {pn}" for pn, pt in fn.params)
-        if not params:
-            params = "void"
-        return f"{ret} {fn.name}({params})"
-    
-    def _gen_function(self, fn: Function) -> str:
-        self.output = []
-        self.vars = {}
-        
-        for pn, pt in fn.params:
-            self.vars[pn] = pt
-        
-        ret = self._type_to_c(fn.return_type)
-        # main() must always return int in C
-        if fn.name == "main":
-            ret = "int"
-        params = ", ".join(f"{self._type_to_c(pt)} {pn}" for pn, pt in fn.params)
-        if not params and fn.name == "main":
-            params = "void"
-        elif not params:
-            params = "void"
-        
-        self.emit(f"{ret} {fn.name}({params}) {{")
-        self.indent += 1
-        
-        for stmt in fn.body:
-            self._gen_stmt(stmt)
-        
-        if fn.name == "main" and fn.return_type in ("void", "i32"):
-            if not fn.body or not isinstance(fn.body[-1], ReturnStmt):
-                self.emit("return 0;")
-        
-        self.indent -= 1
-        self.emit("}")
-        self.emit("")
-        
-        return "\n".join(self.output)
-    
-    def _gen_stmt(self, node: ASTNode):
-        if isinstance(node, VarDecl):
-            self._gen_var_decl(node)
-        elif isinstance(node, Assignment):
-            self._gen_assignment(node)
-        elif isinstance(node, IfStmt):
-            self._gen_if(node)
-        elif isinstance(node, ForStmt):
-            self._gen_for(node)
-        elif isinstance(node, WhileStmt):
-            self._gen_while(node)
-        elif isinstance(node, ReturnStmt):
-            self._gen_return(node)
-        elif isinstance(node, FuncCall):
-            self._gen_func_call_stmt(node)
-        else:
-            # Expression statement
-            expr = self._gen_expr(node)
-            self.emit(f"{expr};")
-    
-    def _gen_var_decl(self, node: VarDecl):
-        if node.value:
-            val_expr = self._gen_expr(node.value)
-            ctype = self._infer_type(node)
-            self.vars[node.name] = node.type_hint or self._guess_type(node.value)
-            if isinstance(node.value, ArrayLit):
-                n = len(node.value.elements)
-                elem_type = self._infer_array_elem_type(node.value)
-                self.emit(f"{elem_type} {node.name}[] = {val_expr};")
-                self.vars[node.name + ".__len"] = str(n)
-            elif isinstance(node.value, RangeExpr):
-                pass  # handled specially
+    def get(self, name: str) -> Any:
+        if name in self.values:
+            return self.values[name]
+        if self.parent is not None:
+            return self.parent.get(name)
+        raise SilentFault(f"missing name: {name}")
+
+    def has(self, name: str) -> bool:
+        if name in self.values:
+            return True
+        if self.parent is not None:
+            return self.parent.has(name)
+        return False
+
+    def define(self, name: str, value: Any) -> None:
+        self.values[name] = value
+
+    def assign(self, name: str, value: Any) -> None:
+        env: Optional[Environment] = self
+        while env is not None:
+            if name in env.values:
+                env.values[name] = value
+                return
+            env = env.parent
+        self.values[name] = value
+
+
+@dataclass
+class UserFunction:
+    name: str
+    params: List[Tuple[str, Optional[str]]]
+    body: List[Node]
+    closure: Environment
+
+
+class Interpreter:
+    def __init__(self, source_path: str = '<memory>', stdout=None):
+        self.source_path = source_path
+        self.stdout = stdout if stdout is not None else sys.stdout
+        self.globals = Environment()
+        self.tomb: List[str] = []
+        self._install_builtins()
+
+    def _install_builtins(self) -> None:
+        def b_whisper(*args: Any) -> None:
+            text = ' '.join(self._as_text(a) for a in args)
+            self.stdout.write(text + '\n')
+
+        def b_listen(prompt: Any = '') -> Any:
+            try:
+                return input(self._as_text(prompt))
+            except EOFError:
+                return ''
+
+        def b_length(value: Any) -> Any:
+            if isinstance(value, (str, list)):
+                return len(value)
+            return None
+
+        def b_count(start: Any, end: Any) -> List[int]:
+            if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                return list(range(int(start), int(end)))
+            return []
+
+        def b_as_memory(value: Any) -> Any:
+            try:
+                if isinstance(value, bool):
+                    return 1 if value else 0
+                if value is None:
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        def b_as_pain(value: Any) -> Any:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def b_as_echo(value: Any) -> str:
+            return self._as_text(value)
+
+        self.globals.define('whisper', b_whisper)
+        self.globals.define('listen', b_listen)
+        self.globals.define('length', b_length)
+        self.globals.define('count', b_count)
+        self.globals.define('as_memory', b_as_memory)
+        self.globals.define('as_pain', b_as_pain)
+        self.globals.define('as_echo', b_as_echo)
+
+    def run(self, program: Program) -> None:
+        funcs: List[FuncDef] = []
+        other: List[Node] = []
+        for node in program.body:
+            if isinstance(node, FuncDef):
+                funcs.append(node)
             else:
-                self.emit(f"{ctype} {node.name} = {val_expr};")
-        else:
-            ctype = self._type_to_c(node.type_hint or "i32")
-            self.vars[node.name] = node.type_hint or "i32"
-            self.emit(f"{ctype} {node.name} = 0;")
-    
-    def _gen_assignment(self, node: Assignment):
-        val = self._gen_expr(node.value)
-        self.emit(f"{node.target} {node.op} {val};")
-    
-    def _gen_if(self, node: IfStmt):
-        cond = self._gen_expr(node.condition)
-        self.emit(f"if ({cond}) {{")
-        self.indent += 1
-        for s in node.then_body:
-            self._gen_stmt(s)
-        self.indent -= 1
-        if node.else_body:
-            self.emit("} else {")
-            self.indent += 1
-            for s in node.else_body:
-                self._gen_stmt(s)
-            self.indent -= 1
-        self.emit("}")
-    
-    def _gen_for(self, node: ForStmt):
-        if isinstance(node.iterable, RangeExpr):
-            start = self._gen_expr(node.iterable.start)
-            end = self._gen_expr(node.iterable.end)
-            self.vars[node.var] = "i32"
-            self.emit(f"for (int {node.var} = {start}; {node.var} < {end}; {node.var}++) {{")
-        elif isinstance(node.iterable, Identifier):
-            arr_name = node.iterable.name
-            len_key = arr_name + ".__len"
-            if len_key in self.vars:
-                length = self.vars[len_key]
-            else:
-                length = f"(sizeof({arr_name})/sizeof({arr_name}[0]))"
-            self.vars[node.var] = "i32"
-            self.emit(f"for (int _i_{node.var} = 0; _i_{node.var} < {length}; _i_{node.var}++) {{")
-            self.indent += 1
-            elem_type = "int"  # default
-            self.emit(f"{elem_type} {node.var} = {arr_name}[_i_{node.var}];")
-            self.indent -= 1
-        elif isinstance(node.iterable, ArrayLit):
-            n = len(node.iterable.elements)
-            arr_expr = self._gen_expr(node.iterable)
-            tmp = f"_arr_{node.var}"
-            elem_type = self._infer_array_elem_type(node.iterable)
-            self.emit(f"{elem_type} {tmp}[] = {arr_expr};")
-            self.vars[node.var] = "i32"
-            self.emit(f"for (int _i_{node.var} = 0; _i_{node.var} < {n}; _i_{node.var}++) {{")
-            self.indent += 1
-            self.emit(f"{elem_type} {node.var} = {tmp}[_i_{node.var}];")
-            self.indent -= 1
-        else:
-            self.emit(f"// unsupported for-in iterable")
-            self.emit(f"{{")
-        
-        self.indent += 1
-        for s in node.body:
-            self._gen_stmt(s)
-        self.indent -= 1
-        self.emit("}")
-    
-    def _gen_while(self, node: WhileStmt):
-        cond = self._gen_expr(node.condition)
-        self.emit(f"while ({cond}) {{")
-        self.indent += 1
-        for s in node.body:
-            self._gen_stmt(s)
-        self.indent -= 1
-        self.emit("}")
-    
-    def _gen_return(self, node: ReturnStmt):
-        if node.value:
-            val = self._gen_expr(node.value)
-            self.emit(f"return {val};")
-        else:
-            self.emit("return;")
-    
-    def _gen_func_call_stmt(self, node: FuncCall):
-        call = self._gen_func_call(node)
-        self.emit(f"{call};")
-    
-    def _gen_func_call(self, node: FuncCall) -> str:
-        # Built-in functions
-        if node.name == "print":
-            return self._gen_print(node.args)
-        elif node.name == "println":
-            return self._gen_print(node.args, newline=True)
-        elif node.name == "len":
-            if node.args and isinstance(node.args[0], Identifier):
-                arr = node.args[0].name
-                len_key = arr + ".__len"
-                if len_key in self.vars:
-                    return self.vars[len_key]
-            return f"strlen({self._gen_expr(node.args[0])})"
-        elif node.name == "input":
-            self.includes.add("#include <stdio.h>")
-            return '_corec_input()'
-        
-        args = ", ".join(self._gen_expr(a) for a in node.args)
-        return f"{node.name}({args})"
-    
-    def _gen_print(self, args: List[ASTNode], newline: bool = True) -> str:
-        if not args:
-            return 'printf("\\n")'
-        
-        fmt_parts = []
-        values = []
-        
-        for arg in args:
-            if isinstance(arg, StringLit):
-                # Parse interpolations {var}
-                s = arg.value
-                parts = re.split(r'\{([^}]+)\}', s)
-                for i, part in enumerate(parts):
-                    if i % 2 == 0:
-                        fmt_parts.append(part.replace('%', '%%'))
-                    else:
-                        # interpolation
-                        var_type = self.vars.get(part, "i32")
-                        if var_type in ("str", "string"):
-                            fmt_parts.append("%s")
-                        elif var_type in ("f32", "f64"):
-                            fmt_parts.append("%g")
-                        else:
-                            fmt_parts.append("%d")
-                        values.append(part)
-            elif isinstance(arg, Identifier):
-                var_type = self.vars.get(arg.name, "i32")
-                if var_type in ("str", "string"):
-                    fmt_parts.append("%s")
-                elif var_type in ("f32", "f64"):
-                    fmt_parts.append("%g")
-                else:
-                    fmt_parts.append("%d")
-                values.append(arg.name)
-            elif isinstance(arg, IntLit):
-                fmt_parts.append("%d")
-                values.append(str(arg.value))
-            elif isinstance(arg, FloatLit):
-                fmt_parts.append("%g")
-                values.append(str(arg.value))
-            elif isinstance(arg, FuncCall):
-                expr = self._gen_func_call(arg)
-                fmt_parts.append("%d")
-                values.append(expr)
-            else:
-                expr = self._gen_expr(arg)
-                fmt_parts.append("%d")
-                values.append(expr)
-        
-        fmt = "".join(fmt_parts)
-        if newline or True:  # CoreC print always adds newline
-            fmt += "\\n"
-        
-        if values:
-            vals = ", " + ", ".join(values)
-            return f'printf("{fmt}"{vals})'
-        else:
-            return f'printf("{fmt}")'
-    
-    def _gen_expr(self, node: ASTNode) -> str:
-        if isinstance(node, IntLit):
-            return str(node.value)
-        elif isinstance(node, FloatLit):
-            return str(node.value)
-        elif isinstance(node, StringLit):
-            return f'"{node.value}"'
-        elif isinstance(node, BoolLit):
-            return "true" if node.value else "false"
-        elif isinstance(node, Identifier):
-            return node.name
-        elif isinstance(node, BinaryOp):
-            if node.op == '.':
-                left = self._gen_expr(node.left)
-                right = self._gen_expr(node.right)
-                return f"{left}.{right}"
-            left = self._gen_expr(node.left)
-            right = self._gen_expr(node.right)
-            return f"({left} {node.op} {right})"
-        elif isinstance(node, UnaryOp):
-            operand = self._gen_expr(node.operand)
-            return f"({node.op}{operand})"
-        elif isinstance(node, FuncCall):
-            return self._gen_func_call(node)
-        elif isinstance(node, ArrayLit):
-            elems = ", ".join(self._gen_expr(e) for e in node.elements)
-            return f"{{{elems}}}"
-        elif isinstance(node, IndexAccess):
-            arr = self._gen_expr(node.array)
-            idx = self._gen_expr(node.index)
-            return f"{arr}[{idx}]"
-        elif isinstance(node, RangeExpr):
-            return f"/* range */"
-        
-        return "/* unknown expr */"
-    
-    def _type_to_c(self, t: str) -> str:
-        mapping = {
-            'i32': 'int', 'i64': 'long long', 'f32': 'float', 'f64': 'double',
-            'bool': 'bool', 'str': 'const char*', 'void': 'void', 'string': 'const char*'
-        }
-        if t.startswith("[]"):
-            inner = self._type_to_c(t[2:])
-            return f"{inner}*"
-        return mapping.get(t, t)
-    
-    def _infer_type(self, node: VarDecl) -> str:
-        if node.type_hint:
-            return self._type_to_c(node.type_hint)
-        if node.value:
-            return self._type_to_c(self._guess_type(node.value))
-        return "int"
-    
-    def _guess_type(self, node: ASTNode) -> str:
-        if isinstance(node, IntLit):
-            return "i32"
-        elif isinstance(node, FloatLit):
-            return "f64"
-        elif isinstance(node, StringLit):
-            return "str"
-        elif isinstance(node, BoolLit):
-            return "bool"
-        elif isinstance(node, FuncCall):
-            return self.functions.get(node.name, "i32")
-        elif isinstance(node, BinaryOp):
-            return self._guess_type(node.left)
-        elif isinstance(node, Identifier):
-            return self.vars.get(node.name, "i32")
-        return "i32"
-    
-    def _infer_array_elem_type(self, node: ArrayLit) -> str:
-        if node.elements:
-            t = self._guess_type(node.elements[0])
-            return self._type_to_c(t)
-        return "int"
+                other.append(node)
+        for fn in funcs:
+            self.globals.define(fn.name, UserFunction(
+                name=fn.name, params=fn.params, body=fn.body, closure=self.globals,
+            ))
+        try:
+            for node in other:
+                self._exec(node, self.globals)
+            if self.globals.has('main'):
+                self._call(self.globals.get('main'), [], line=0)
+        except FadeSignal:
+            pass
+        except SilentFault as ex:
+            self.tomb.append(str(ex))
+
+    def _exec(self, node: Node, env: Environment) -> None:
+        try:
+            if isinstance(node, VarDecl):
+                value = self._eval(node.value, env) if node.value is not None else None
+                env.define(node.name, value)
+                return
+            if isinstance(node, Assign):
+                value = self._eval(node.value, env)
+                target = node.target
+                if isinstance(target, Name):
+                    env.assign(target.text, value)
+                    return
+                if isinstance(target, Index):
+                    container = self._eval(target.target, env)
+                    idx = self._eval(target.index, env)
+                    if isinstance(container, list) and isinstance(idx, (int, float)):
+                        i = int(idx)
+                        if 0 <= i < len(container):
+                            container[i] = value
+                    return
+                return
+            if isinstance(node, IfStmt):
+                cond = self._truthy(self._eval(node.cond, env))
+                branch = node.then_body if cond else node.else_body
+                inner = Environment(env)
+                for stmt in branch:
+                    self._exec(stmt, inner)
+                return
+            if isinstance(node, WhileStmt):
+                steps = 0
+                while self._truthy(self._eval(node.cond, env)):
+                    inner = Environment(env)
+                    for stmt in node.body:
+                        self._exec(stmt, inner)
+                    steps += 1
+                    if steps > 10_000_000:
+                        self.tomb.append(f"line {node.line}: drown ran too long")
+                        break
+                return
+            if isinstance(node, ForStmt):
+                seq = self._eval(node.iterable, env)
+                seq = self._iter_of(seq)
+                for item in seq:
+                    inner = Environment(env)
+                    inner.define(node.var, item)
+                    for stmt in node.body:
+                        self._exec(stmt, inner)
+                return
+            if isinstance(node, FadeStmt):
+                value = self._eval(node.value, env) if node.value is not None else None
+                raise FadeSignal(value)
+            if isinstance(node, ExprStmt):
+                self._eval(node.value, env)
+                return
+            if isinstance(node, FuncDef):
+                env.define(node.name, UserFunction(
+                    name=node.name, params=node.params, body=node.body, closure=env,
+                ))
+                return
+        except FadeSignal:
+            raise
+        except SilentFault as ex:
+            self.tomb.append(str(ex))
+
+    def _eval(self, node: Optional[Node], env: Environment) -> Any:
+        if node is None:
+            return None
+        try:
+            if isinstance(node, NumberLit):
+                return node.value
+            if isinstance(node, BoolLit):
+                return node.value
+            if isinstance(node, VoidLit):
+                return None
+            if isinstance(node, StringLit):
+                out = ''
+                for piece in node.parts:
+                    if isinstance(piece, str):
+                        out += piece
+                    elif isinstance(piece, tuple) and piece[0] == 'var':
+                        name = piece[1]
+                        try:
+                            value = env.get(name)
+                        except SilentFault:
+                            value = None
+                        out += self._as_text(value)
+                return out
+            if isinstance(node, ArrayLit):
+                return [self._eval(item, env) for item in node.items]
+            if isinstance(node, RangeLit):
+                start = self._eval(node.start, env)
+                end = self._eval(node.end, env)
+                if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+                    return list(range(int(start), int(end)))
+                return []
+            if isinstance(node, Name):
+                return env.get(node.text)
+            if isinstance(node, Unary):
+                value = self._eval(node.operand, env)
+                if node.op == '-':
+                    if isinstance(value, (int, float)):
+                        return -value
+                    return None
+                if node.op == 'not':
+                    return not self._truthy(value)
+                return None
+            if isinstance(node, Binary):
+                if node.op == 'and':
+                    left = self._eval(node.left, env)
+                    if not self._truthy(left):
+                        return left
+                    return self._eval(node.right, env)
+                if node.op == 'or':
+                    left = self._eval(node.left, env)
+                    if self._truthy(left):
+                        return left
+                    return self._eval(node.right, env)
+                left = self._eval(node.left, env)
+                right = self._eval(node.right, env)
+                return self._apply_binary(node.op, left, right)
+            if isinstance(node, Index):
+                target = self._eval(node.target, env)
+                idx = self._eval(node.index, env)
+                if isinstance(target, (str, list)) and isinstance(idx, (int, float)):
+                    i = int(idx)
+                    if 0 <= i < len(target):
+                        return target[i]
+                return None
+            if isinstance(node, Call):
+                callee = self._eval(node.callee, env)
+                args = [self._eval(a, env) for a in node.args]
+                return self._call(callee, args, line=node.line)
+        except FadeSignal:
+            raise
+        except SilentFault as ex:
+            self.tomb.append(str(ex))
+            return None
+        except Exception as ex:
+            self.tomb.append(f"line {node.line}: {type(ex).__name__}: {ex}")
+            return None
+        return None
+
+    def _apply_binary(self, op: str, left: Any, right: Any) -> Any:
+        try:
+            if op == '+':
+                if isinstance(left, str) or isinstance(right, str):
+                    return self._as_text(left) + self._as_text(right)
+                if isinstance(left, list) and isinstance(right, list):
+                    return left + right
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    return left + right
+                return None
+            if op == '-':
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    return left - right
+                return None
+            if op == '*':
+                if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                    return left * right
+                if isinstance(left, str) and isinstance(right, int):
+                    return left * right
+                return None
+            if op == '/':
+                if isinstance(right, (int, float)) and right != 0 and isinstance(left, (int, float)):
+                    if isinstance(left, int) and isinstance(right, int):
+                        return left // right
+                    return left / right
+                return None
+            if op == '%':
+                if isinstance(right, (int, float)) and right != 0 and isinstance(left, (int, float)):
+                    return left % right
+                return None
+            if op == '==':
+                return left == right
+            if op == '!=':
+                return left != right
+            if op == '<':
+                return self._compare(left, right, lambda a, b: a < b)
+            if op == '>':
+                return self._compare(left, right, lambda a, b: a > b)
+            if op == '<=':
+                return self._compare(left, right, lambda a, b: a <= b)
+            if op == '>=':
+                return self._compare(left, right, lambda a, b: a >= b)
+        except Exception as ex:
+            self.tomb.append(f"operator {op}: {type(ex).__name__}: {ex}")
+            return None
+        return None
+
+    def _compare(self, left: Any, right: Any, op: Callable[[Any, Any], bool]) -> bool:
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+            return op(left, right)
+        if isinstance(left, str) and isinstance(right, str):
+            return op(left, right)
+        return False
+
+    def _call(self, callee: Any, args: List[Any], line: int) -> Any:
+        if callee is None:
+            self.tomb.append(f"line {line}: tried to call void")
+            return None
+        if isinstance(callee, UserFunction):
+            inner = Environment(callee.closure)
+            for (pname, _ptype), value in zip(callee.params, args):
+                inner.define(pname, value)
+            for pname, _ptype in callee.params[len(args):]:
+                inner.define(pname, None)
+            try:
+                for stmt in callee.body:
+                    self._exec(stmt, inner)
+            except FadeSignal as fs:
+                return fs.value
+            return None
+        if callable(callee):
+            try:
+                return callee(*args)
+            except SilentFault as ex:
+                self.tomb.append(str(ex))
+                return None
+            except Exception as ex:
+                self.tomb.append(f"line {line}: {type(ex).__name__}: {ex}")
+                return None
+        self.tomb.append(f"line {line}: not a voice")
+        return None
+
+    def _truthy(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, (str, list)):
+            return len(value) > 0
+        return True
+
+    def _iter_of(self, value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            return list(value)
+        if isinstance(value, (int, float)):
+            return list(range(int(value)))
+        return []
+
+    def _as_text(self, value: Any) -> str:
+        if value is None:
+            return 'void'
+        if isinstance(value, bool):
+            return 'still' if value else 'gone'
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value)) + '.0'
+            return repr(value)
+        if isinstance(value, list):
+            return '[' + ', '.join(self._as_text(v) for v in value) + ']'
+        return str(value)
 
 
-# ============== CLI ==============
+def parse_source(source: str) -> Program:
+    tokens = Lexer(source).tokenize()
+    return Parser(tokens).parse()
 
-def compile_file(source_path: str, output_path: str = None, run: bool = False, keep_c: bool = False):
-    if not os.path.exists(source_path):
-        print(f"Error: File '{source_path}' not found")
-        sys.exit(1)
-    
-    with open(source_path, 'r') as f:
-        source = f.read()
-    
-    # Determine output name
-    base = os.path.splitext(source_path)[0]
-    if output_path is None:
-        output_path = base
-    c_path = base + ".c"
-    
+
+def run_source(source: str, path: str = '<memory>') -> Dict[str, Any]:
+    out_buffer = io.StringIO()
+    start = time.time()
     try:
-        # Lex
-        lexer = Lexer(source)
-        tokens = lexer.tokenize()
-        
-        # Parse
-        parser = Parser(tokens)
-        ast = parser.parse()
-        
-        # Generate C
-        gen = CodeGen()
-        c_code = gen.generate(ast)
-        
-        # Write C file
-        with open(c_path, 'w') as f:
-            f.write(c_code)
-        
-        # Compile with gcc
-        gcc_cmd = ["gcc", "-O2", "-o", output_path, c_path, "-lm"]
-        result = subprocess.run(gcc_cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"C compilation error:\n{result.stderr}")
-            print(f"\nGenerated C code saved to: {c_path}")
-            sys.exit(1)
-        
-        if not keep_c:
-            os.remove(c_path)
-        
-        print(f"✓ Compiled: {source_path} → {output_path}")
-        
-        if run:
-            print(f"─── Running {output_path} ───")
-            os.execv(output_path, [output_path])
-    
-    except SyntaxError as e:
-        print(f"CoreC Syntax Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"CoreC Compiler Error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        program = parse_source(source)
+    except (LexError, ParseError) as ex:
+        return {
+            'output': '',
+            'tomb': [str(ex)],
+            'elapsed_ms': int((time.time() - start) * 1000),
+        }
+    interp = Interpreter(source_path=path, stdout=out_buffer)
+    interp.run(program)
+    elapsed_ms = int((time.time() - start) * 1000)
+    return {
+        'output': out_buffer.getvalue(),
+        'tomb': list(interp.tomb),
+        'elapsed_ms': elapsed_ms,
+    }
 
 
-def emit_c(source_path: str):
-    """Just emit C code without compiling."""
-    with open(source_path, 'r') as f:
-        source = f.read()
-    
-    lexer = Lexer(source)
-    tokens = lexer.tokenize()
-    parser = Parser(tokens)
-    ast = parser.parse()
-    gen = CodeGen()
-    c_code = gen.generate(ast)
-    print(c_code)
+def run_file(path: str) -> int:
+    if not os.path.isfile(path):
+        return 0
+    with open(path, 'r', encoding='utf-8') as fh:
+        source = fh.read()
+    try:
+        program = parse_source(source)
+    except (LexError, ParseError) as ex:
+        sys.stderr.write(f"{ex}\n")
+        return 1
+    interp = Interpreter(source_path=path, stdout=sys.stdout)
+    interp.run(program)
+    sys.stdout.flush()
+    if interp.tomb:
+        tomb_path = path + '.tomb'
+        try:
+            with open(tomb_path, 'w', encoding='utf-8') as fh:
+                for line in interp.tomb:
+                    fh.write(line + '\n')
+        except OSError:
+            pass
+    return 0
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("CoreC Compiler v0.1")
-        print("Usage:")
-        print("  corec build <file.crc>         Compile to binary")
-        print("  corec run <file.crc>           Compile and run")
-        print("  corec emit <file.crc>          Show generated C code")
-        print("  corec build <file.crc> -o out  Compile with custom output name")
-        print("  corec build <file.crc> --keep-c  Keep generated .c file")
-        sys.exit(0)
-    
-    cmd = sys.argv[1]
-    
-    if cmd == "build":
-        if len(sys.argv) < 3:
-            print("Usage: corec build <file.crc> [-o output] [--keep-c]")
-            sys.exit(1)
-        source = sys.argv[2]
-        output = None
-        keep_c = "--keep-c" in sys.argv
-        if "-o" in sys.argv:
-            idx = sys.argv.index("-o")
-            output = sys.argv[idx + 1]
-        compile_file(source, output, run=False, keep_c=keep_c)
-    
-    elif cmd == "run":
-        if len(sys.argv) < 3:
-            print("Usage: corec run <file.crc>")
-            sys.exit(1)
-        compile_file(sys.argv[2], run=True)
-    
-    elif cmd == "emit":
-        if len(sys.argv) < 3:
-            print("Usage: corec emit <file.crc>")
-            sys.exit(1)
-        emit_c(sys.argv[2])
-    
-    else:
-        # If first arg is a .crc file, compile and run it
-        if cmd.endswith('.crc'):
-            compile_file(cmd, run=True)
-        else:
-            print(f"Unknown command: {cmd}")
-            sys.exit(1)
+def emit_json(path: str) -> int:
+    if not os.path.isfile(path):
+        return 0
+    with open(path, 'r', encoding='utf-8') as fh:
+        source = fh.read()
+    result = run_source(source, path=path)
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+def main() -> int:
+    parser = argparse.ArgumentParser(prog='corec', add_help=True)
+    sub = parser.add_subparsers(dest='cmd')
+    p_run = sub.add_parser('run')
+    p_run.add_argument('file')
+    p_emit = sub.add_parser('emit')
+    p_emit.add_argument('file')
+    args = parser.parse_args()
+    if args.cmd == 'run':
+        return run_file(args.file)
+    if args.cmd == 'emit':
+        return emit_json(args.file)
+    parser.print_help()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

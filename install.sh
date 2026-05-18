@@ -1,83 +1,67 @@
-#!/bin/bash
-# CoreC installer for Linux
-
+#!/usr/bin/env bash
 set -e
 
-echo ""
-echo "════════════════════════════════════════"
-echo "  CoreC Installer  v0.1"
-echo "  Blazingly fast language → native C"
-echo "════════════════════════════════════════"
-echo ""
-
-# Check dependencies
-echo "→ Checking dependencies..."
-
-MISSING=()
-command -v python3 >/dev/null || MISSING+=("python3")
-command -v gcc >/dev/null || MISSING+=("gcc")
-
-if [ ${#MISSING[@]} -gt 0 ]; then
-    echo "  ✗ Missing: ${MISSING[*]}"
-    echo ""
-    echo "Install them with:"
-    echo "  Debian/Ubuntu: sudo apt install python3 gcc build-essential"
-    echo "  Fedora:        sudo dnf install python3 gcc"
-    echo "  Arch:          sudo pacman -S python gcc base-devel"
-    exit 1
-fi
-
-echo "  ✓ python3: $(python3 --version)"
-echo "  ✓ gcc:     $(gcc --version | head -1)"
-
-# Install corec command
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$INSTALL_DIR"
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMPILER="$SCRIPT_DIR/compiler/corec.py"
+echo
+echo "  abyss / core-c installer"
+echo "  ------------------------"
+echo "  a language by mark. the rain came with it."
+echo
 
-if [ ! -f "$COMPILER" ]; then
-    echo "  ✗ Compiler not found at: $COMPILER"
+MISSING=()
+command -v python3 >/dev/null || MISSING+=("python3")
+if [ ${#MISSING[@]} -gt 0 ]; then
+    echo "  missing: ${MISSING[*]}"
+    echo "  debian/ubuntu: sudo apt install python3"
     exit 1
 fi
 
-# Create wrapper
-cat > "$INSTALL_DIR/corec" << EOF
-#!/bin/bash
-exec python3 "$COMPILER" "\$@"
+COREC="$SCRIPT_DIR/compiler/corec.py"
+if [ ! -f "$COREC" ]; then
+    echo "  the interpreter at $COREC is missing."
+    exit 1
+fi
+
+cat > "$INSTALL_DIR/corec" <<EOF
+#!/usr/bin/env bash
+exec python3 "$COREC" "\$@"
 EOF
 chmod +x "$INSTALL_DIR/corec"
+echo "  installed: $INSTALL_DIR/corec"
 
-# Install IDE if available
-IDE_BIN="$SCRIPT_DIR/ide-native/corec-ide"
-if [ -f "$IDE_BIN" ]; then
-    ln -sf "$IDE_BIN" "$INSTALL_DIR/corec-ide"
-    echo "  ✓ Installed: $INSTALL_DIR/corec-ide"
+if command -v pkg-config >/dev/null && pkg-config --exists gtk+-3.0; then
+    if command -v g++ >/dev/null && command -v make >/dev/null; then
+        echo "  building abyss (the editor)..."
+        (cd "$SCRIPT_DIR/ide-native" && make >/dev/null)
+        if [ -x "$SCRIPT_DIR/ide-native/abyss" ]; then
+            cat > "$INSTALL_DIR/abyss" <<EOF
+#!/usr/bin/env bash
+export COREC_HOME="$SCRIPT_DIR"
+exec "$SCRIPT_DIR/ide-native/abyss" "\$@"
+EOF
+            chmod +x "$INSTALL_DIR/abyss"
+            echo "  installed: $INSTALL_DIR/abyss"
+        fi
+    else
+        echo "  g++ / make not found; skipping abyss build."
+    fi
+else
+    echo "  gtk+-3.0 not found; skipping abyss build."
+    echo "  on debian: sudo apt install libgtk-3-dev build-essential pkg-config"
 fi
 
-echo "  ✓ Installed: $INSTALL_DIR/corec"
-echo ""
-
-# Check PATH
 if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo "⚠️  $INSTALL_DIR is not in your \$PATH"
-    echo "    Add to your shell config (~/.bashrc, ~/.zshrc):"
-    echo ""
-    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
-    echo ""
+    echo
+    echo "  $INSTALL_DIR is not in your PATH."
+    echo "  add this line to ~/.bashrc or ~/.zshrc:"
+    echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 
-echo "════════════════════════════════════════"
-echo "  Done!"
-echo "════════════════════════════════════════"
-echo ""
-echo "Usage:"
-echo "  corec run hello.crc        # Compile and run"
-echo "  corec build hello.crc      # Build binary"
-echo "  corec emit hello.crc       # Show generated C"
-echo "  corec-ide                  # Launch GUI IDE"
-echo ""
-echo "Try:"
-echo "  corec run $SCRIPT_DIR/examples/hello.crc"
-echo ""
+echo
+echo "  try:"
+echo "      corec run $SCRIPT_DIR/examples/here.crc"
+echo "      abyss"
+echo

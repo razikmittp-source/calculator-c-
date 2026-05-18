@@ -1,0 +1,14 @@
+voice fall(drops: memory) {
+    keep i: memory = 0
+    drown i < drops {
+        whisper(".")
+        i = i + 1
+    }
+}
+
+voice main() {
+    whisper("the rain started at three.")
+    whisper("nobody noticed.")
+    fall(7)
+    whisper("the room was quiet again.")
+}

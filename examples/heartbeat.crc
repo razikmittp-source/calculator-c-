@@ -1,0 +1,16 @@
+voice heartbeat(times: memory) {
+    keep n: memory = 0
+    drown n < times {
+        perhaps n % 2 == 0 {
+            whisper("thump.")
+        } otherwise {
+            whisper("...")
+        }
+        n = n + 1
+    }
+}
+
+voice main() {
+    heartbeat(6)
+    whisper("then nothing.")
+}

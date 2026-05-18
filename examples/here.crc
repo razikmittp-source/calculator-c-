@@ -1,0 +1,4 @@
+voice main() {
+    keep name: echo = "i am here"
+    whisper(name)
+}

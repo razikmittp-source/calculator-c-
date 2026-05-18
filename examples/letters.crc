@@ -1,0 +1,12 @@
+voice main() {
+    keep letters: echo = [
+        "i wrote you a letter today.",
+        "i didn't send it.",
+        "i don't know your address anymore.",
+        "i think you would have liked the rain.",
+        "i'll keep writing anyway."
+    ]
+    bury line in letters {
+        whisper(line)
+    }
+}
