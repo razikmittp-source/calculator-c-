@@ -806,7 +806,8 @@ class Interpreter:
                         name = piece[1]
                         try:
                             value = env.get(name)
-                        except SilentFault:
+                        except SilentFault as ex:
+                            self.tomb.append(str(ex))
                             value = None
                         out += self._as_text(value)
                 return out
@@ -850,6 +851,9 @@ class Interpreter:
                     i = int(idx)
                     if 0 <= i < len(target):
                         return target[i]
+                    raise SilentFault(f"line {node.line}: bad index {i} (length {len(target)})")
+                if target is None:
+                    raise SilentFault(f"line {node.line}: tried to index void")
                 return None
             if isinstance(node, Call):
                 callee = self._eval(node.callee, env)
@@ -886,13 +890,17 @@ class Interpreter:
                     return left * right
                 return None
             if op == '/':
-                if isinstance(right, (int, float)) and right != 0 and isinstance(left, (int, float)):
+                if isinstance(right, (int, float)) and isinstance(left, (int, float)):
+                    if right == 0:
+                        raise SilentFault("division by zero")
                     if isinstance(left, int) and isinstance(right, int):
                         return left // right
                     return left / right
                 return None
             if op == '%':
-                if isinstance(right, (int, float)) and right != 0 and isinstance(left, (int, float)):
+                if isinstance(right, (int, float)) and isinstance(left, (int, float)):
+                    if right == 0:
+                        raise SilentFault("modulo by zero")
                     return left % right
                 return None
             if op == '==':
@@ -907,6 +915,9 @@ class Interpreter:
                 return self._compare(left, right, lambda a, b: a <= b)
             if op == '>=':
                 return self._compare(left, right, lambda a, b: a >= b)
+        except SilentFault as ex:
+            self.tomb.append(str(ex))
+            return None
         except Exception as ex:
             self.tomb.append(f"operator {op}: {type(ex).__name__}: {ex}")
             return None
