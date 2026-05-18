@@ -177,6 +177,9 @@ struct AppState {
     GtkWidget *status_rain = nullptr;
     GtkWidget *run_button = nullptr;
     GtkWidget *run_meta = nullptr;
+    GtkWidget *build_linux_btn = nullptr;
+    GtkWidget *build_windows_btn = nullptr;
+    GtkWidget *build_macos_btn = nullptr;
     GtkTextTag *tomb_tag = nullptr;
     GtkTextTag *him_tag = nullptr;
     GtkTextTag *you_tag = nullptr;
@@ -189,6 +192,7 @@ struct AppState {
     bool darkened = false;
     std::string interpreter_path;
     std::string thoughts_path;
+    std::string build_dir;
 
     std::mt19937 rng{(unsigned)std::chrono::steady_clock::now().time_since_epoch().count()};
 
@@ -549,6 +553,126 @@ static RunResult run_program(AppState *st, const std::string &source) {
 }
 
 
+static void set_build_buttons_sensitive(AppState *st, bool sensitive) {
+    if (st->build_linux_btn) gtk_widget_set_sensitive(st->build_linux_btn, sensitive);
+    if (st->build_windows_btn) gtk_widget_set_sensitive(st->build_windows_btn, sensitive);
+    if (st->build_macos_btn) gtk_widget_set_sensitive(st->build_macos_btn, sensitive);
+}
+
+
+static std::string current_doc_basename(AppState *st) {
+    if (st->active_index < 0 || st->active_index >= (int)st->docs.size()) return "page";
+    std::string name = st->docs[st->active_index].name;
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    if (name.empty()) name = "page";
+    return name;
+}
+
+
+// invoke `corec build --target <target>` against the current buffer contents.
+// the source is written to a temporary .crc with the active document's base
+// name so the produced .pyz/.bat/.command files keep that name. the build
+// output ends up under ~/.config/abyss/builds/<docname>/, which is shown in
+// the console panel so the user can find it.
+static void build_for_target(AppState *st, const std::string &target) {
+    std::string base = current_doc_basename(st);
+    if (st->build_dir.empty()) {
+        std::string cfg = ensure_config_dir();
+        st->build_dir = cfg + "/builds";
+        mkdir(st->build_dir.c_str(), 0700);
+    }
+    std::string out_dir = st->build_dir + "/" + base;
+    mkdir(out_dir.c_str(), 0700);
+
+    char tmpl[] = "/tmp/abyss-build-XXXXXX";
+    if (mkdtemp(tmpl) == NULL) {
+        append_console(st, "could not make a workspace for the build.\n", true);
+        return;
+    }
+    std::string crc_path = std::string(tmpl) + "/" + base + ".crc";
+    std::string source = text_of(st->editor_buffer);
+    if (!write_file(crc_path, source)) {
+        append_console(st, "could not write the source for the build.\n", true);
+        return;
+    }
+    std::string out_path = out_dir + "/" + base;
+
+    clear_console(st);
+    std::string banner = "building for " + target + " ...\n";
+    append_console(st, banner, false);
+    set_build_buttons_sensitive(st, false);
+    gtk_widget_set_sensitive(st->run_button, FALSE);
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    long started = now_ms();
+    const char *interp = st->interpreter_path.c_str();
+    gchar *cmd_argv[] = {
+        (gchar *)"python3",
+        (gchar *)interp,
+        (gchar *)"build",
+        (gchar *)crc_path.c_str(),
+        (gchar *)"-o",
+        (gchar *)out_path.c_str(),
+        (gchar *)"--target",
+        (gchar *)target.c_str(),
+        NULL,
+    };
+    gchar *out = NULL;
+    gchar *err = NULL;
+    gint status = 0;
+    GError *gerr = NULL;
+    gboolean ok = g_spawn_sync(NULL, cmd_argv, NULL,
+                               G_SPAWN_SEARCH_PATH,
+                               NULL, NULL,
+                               &out, &err, &status, &gerr);
+    long elapsed = now_ms() - started;
+
+    if (!ok) {
+        std::string msg = gerr ? gerr->message : "could not invoke the interpreter.";
+        append_console(st, msg + "\n", true);
+        if (gerr) g_error_free(gerr);
+    } else if (out && *out) {
+        append_console(st, std::string(out), false);
+    }
+    if (err && *err) {
+        append_console(st, std::string(err), true);
+    }
+    if (out) g_free(out);
+    if (err) g_free(err);
+
+    if (ok && status == 0) {
+        std::string trailer = "\nfinished in " + std::to_string(elapsed) + " ms\n";
+        trailer += "output directory: " + out_dir + "\n";
+        if (target == "linux") {
+            trailer += "run with:  python3 " + out_path + ".pyz\n";
+            trailer += "or chmod and run:  " + out_path + ".pyz\n";
+        } else if (target == "windows") {
+            trailer += "copy .pyz + .bat to a windows machine, then double-click the .bat\n";
+        } else if (target == "macos") {
+            trailer += "copy .pyz + .command to a mac, chmod +x the .command, then double-click\n";
+        }
+        append_console(st, trailer, false);
+    } else {
+        flash_dark(st);
+    }
+
+    unlink(crc_path.c_str());
+    rmdir(tmpl);
+
+    set_build_buttons_sensitive(st, true);
+    gtk_widget_set_sensitive(st->run_button, TRUE);
+}
+
+
+static void on_build_clicked(GtkButton *btn, gpointer data) {
+    AppState *st = static_cast<AppState *>(data);
+    const char *target = (const char *)g_object_get_data(G_OBJECT(btn), "build-target");
+    if (!target) return;
+    build_for_target(st, target);
+}
+
+
 static void on_run_clicked(GtkButton *btn, gpointer data) {
     AppState *st = static_cast<AppState *>(data);
     std::string source = text_of(st->editor_buffer);
@@ -840,6 +964,25 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(console_head), console_lbl, TRUE, TRUE, 0);
     st.run_meta = make_label("", NULL, GTK_ALIGN_END);
     gtk_box_pack_start(GTK_BOX(console_head), st.run_meta, FALSE, FALSE, 0);
+
+    // one button per target os. each writes the current buffer to a temp
+    // .crc file and calls `corec build --target <os>`; output ends up under
+    // ~/.config/abyss/builds/<docname>/ and is announced in the console.
+    st.build_linux_btn = gtk_button_new_with_label("build linux");
+    g_object_set_data(G_OBJECT(st.build_linux_btn), "build-target", (gpointer)"linux");
+    g_signal_connect(st.build_linux_btn, "clicked", G_CALLBACK(on_build_clicked), &st);
+    gtk_box_pack_start(GTK_BOX(console_head), st.build_linux_btn, FALSE, FALSE, 0);
+
+    st.build_windows_btn = gtk_button_new_with_label("build windows");
+    g_object_set_data(G_OBJECT(st.build_windows_btn), "build-target", (gpointer)"windows");
+    g_signal_connect(st.build_windows_btn, "clicked", G_CALLBACK(on_build_clicked), &st);
+    gtk_box_pack_start(GTK_BOX(console_head), st.build_windows_btn, FALSE, FALSE, 0);
+
+    st.build_macos_btn = gtk_button_new_with_label("build macos");
+    g_object_set_data(G_OBJECT(st.build_macos_btn), "build-target", (gpointer)"macos");
+    g_signal_connect(st.build_macos_btn, "clicked", G_CALLBACK(on_build_clicked), &st);
+    gtk_box_pack_start(GTK_BOX(console_head), st.build_macos_btn, FALSE, FALSE, 0);
+
     st.run_button = gtk_button_new_with_label("run");
     gtk_style_context_add_class(gtk_widget_get_style_context(st.run_button), "run-button");
     g_signal_connect(st.run_button, "clicked", G_CALLBACK(on_run_clicked), &st);
