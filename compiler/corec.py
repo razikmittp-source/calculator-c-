@@ -1041,18 +1041,349 @@ def emit_json(path: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# build / bundle
+#
+# mark has one rule for builds: nobody should be told to install seven things
+# before they can run a program. so `corec build hello.crc` always produces
+# something that works, even if the host machine has nothing but python.
+#
+# three modes:
+#   portable   default. bundles the interpreter + your source into a single
+#              `.pyz` zipapp. runs anywhere python3 is installed. the file
+#              is the program. no extra steps.
+#   native     uses pyinstaller (if available) to make a true single binary
+#              with no python dependency. only for the current os --
+#              pyinstaller does not cross-compile.
+#   actions    prints the commands you'd push to github so its actions
+#              workflow builds native binaries for linux/windows/mac for you.
+#              this is the honest cross-compile path until we have a real
+#              backend.
+# ---------------------------------------------------------------------------
+
+
+_TARGETS = ('linux', 'windows', 'macos', 'host')
+
+
+def _detect_host_target() -> str:
+    p = sys.platform
+    if p.startswith('linux'):
+        return 'linux'
+    if p == 'darwin':
+        return 'macos'
+    if p.startswith('win') or p == 'cygwin':
+        return 'windows'
+    return 'linux'
+
+
+def _target_for(target: str) -> str:
+    if target in (None, '', 'host'):
+        return _detect_host_target()
+    if target not in _TARGETS:
+        return _detect_host_target()
+    return target
+
+
+_LAUNCHER_TEMPLATE = '''\
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from corec import parse_source, Interpreter, LexError, ParseError
+
+# the source is embedded directly so the program runs even when bundled
+# inside a .pyz zip archive (where regular file IO does not work).
+SOURCE = {source_literal}
+DISPLAY_PATH = {display_path!r}
+TOMB_NAME = {tomb_name!r}
+
+
+def main() -> int:
+    try:
+        program = parse_source(SOURCE)
+    except (LexError, ParseError) as ex:
+        sys.stderr.write(str(ex) + '\\n')
+        return 1
+    interp = Interpreter(source_path=DISPLAY_PATH, stdout=sys.stdout)
+    interp.run(program)
+    sys.stdout.flush()
+    if interp.tomb:
+        try:
+            with open(TOMB_NAME, 'w', encoding='utf-8') as fh:
+                for line in interp.tomb:
+                    fh.write(line + '\\n')
+        except OSError:
+            pass
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+'''
+
+
+_WIN_BAT_WRAPPER = '''\
+@echo off
+where python >nul 2>&1
+if errorlevel 1 (
+  where python3 >nul 2>&1
+  if errorlevel 1 (
+    echo python is not installed. install it from https://www.python.org/downloads/windows/
+    exit /b 1
+  )
+  python3 "%~dp0%~n0.pyz" %*
+  exit /b %errorlevel%
+)
+python "%~dp0%~n0.pyz" %*
+exit /b %errorlevel%
+'''
+
+
+_MAC_COMMAND_WRAPPER = '''\
+#!/usr/bin/env bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NAME="$(basename "${BASH_SOURCE[0]}")"
+NAME="${NAME%.command}"
+exec /usr/bin/env python3 "$DIR/$NAME.pyz" "$@"
+'''
+
+
+def _build_portable(crc_path: str, out_path: str, target: str) -> int:
+    """Build a portable single-file program (`.pyz` zipapp).
+
+    The output file IS the program. Run it with python3. No install step.
+    For windows/macos we additionally drop a tiny wrapper that finds python.
+    """
+    import shutil
+    import tempfile
+    import zipapp
+
+    if not os.path.isfile(crc_path):
+        sys.stderr.write("there's nothing at that path.\n")
+        return 1
+    interp_self = os.path.abspath(__file__)
+    if not os.path.isfile(interp_self):
+        sys.stderr.write("the interpreter has gone missing.\n")
+        return 1
+
+    base = os.path.splitext(os.path.basename(crc_path))[0]
+    target = _target_for(target)
+    if out_path:
+        out_pyz = out_path
+        if not out_pyz.endswith('.pyz'):
+            out_pyz = out_pyz + '.pyz'
+    else:
+        out_pyz = base + '.pyz'
+
+    with open(crc_path, 'r', encoding='utf-8') as fh:
+        source_text = fh.read()
+
+    with tempfile.TemporaryDirectory(prefix='corec-build-') as work:
+        shutil.copyfile(interp_self, os.path.join(work, 'corec.py'))
+        launcher = _LAUNCHER_TEMPLATE.format(
+            source_literal=repr(source_text),
+            display_path=crc_path,
+            tomb_name=base + '.tomb',
+        )
+        with open(os.path.join(work, '__main__.py'), 'w', encoding='utf-8') as fh:
+            fh.write(launcher)
+
+        out_pyz_abs = os.path.abspath(out_pyz)
+        zipapp.create_archive(
+            source=work,
+            target=out_pyz_abs,
+            interpreter='/usr/bin/env python3',
+        )
+    try:
+        os.chmod(out_pyz, 0o755)
+    except OSError:
+        pass
+
+    sys.stdout.write('built: ' + out_pyz + '\n')
+
+    if target == 'windows':
+        bat_path = os.path.splitext(out_pyz)[0] + '.bat'
+        with open(bat_path, 'w', encoding='utf-8') as fh:
+            fh.write(_WIN_BAT_WRAPPER)
+        sys.stdout.write('built: ' + bat_path + '\n')
+    elif target == 'macos':
+        cmd_path = os.path.splitext(out_pyz)[0] + '.command'
+        with open(cmd_path, 'w', encoding='utf-8') as fh:
+            fh.write(_MAC_COMMAND_WRAPPER)
+        try:
+            os.chmod(cmd_path, 0o755)
+        except OSError:
+            pass
+        sys.stdout.write('built: ' + cmd_path + '\n')
+
+    return 0
+
+
+def _build_native(crc_path: str, out_path: str) -> int:
+    """Build a true single native binary using PyInstaller for the current OS.
+
+    PyInstaller cannot cross-compile. If you want windows/mac binaries from a
+    linux host, push a tag and let github actions do it; see `corec build --actions`.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    if not os.path.isfile(crc_path):
+        sys.stderr.write("there's nothing at that path.\n")
+        return 1
+    if shutil.which('pyinstaller') is None:
+        sys.stderr.write(
+            "pyinstaller is not installed.\n"
+            "  pip install pyinstaller\n"
+            "or run with --portable to skip it.\n"
+        )
+        return 1
+
+    base = os.path.splitext(os.path.basename(crc_path))[0]
+    out_name = base
+    if out_path:
+        out_name = os.path.splitext(os.path.basename(out_path))[0]
+
+    interp_self = os.path.abspath(__file__)
+
+    with open(crc_path, 'r', encoding='utf-8') as fh:
+        source_text = fh.read()
+
+    with tempfile.TemporaryDirectory(prefix='corec-native-') as work:
+        shutil.copyfile(interp_self, os.path.join(work, 'corec.py'))
+        launcher = _LAUNCHER_TEMPLATE.format(
+            source_literal=repr(source_text),
+            display_path=crc_path,
+            tomb_name=base + '.tomb',
+        )
+        entry = os.path.join(work, '__main__.py')
+        with open(entry, 'w', encoding='utf-8') as fh:
+            fh.write(launcher)
+
+        out_dir = os.path.abspath(os.path.dirname(out_path) if out_path else '.')
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = [
+            'pyinstaller',
+            '--onefile',
+            '--name', out_name,
+            '--distpath', out_dir,
+            '--workpath', os.path.join(work, '_work'),
+            '--specpath', work,
+            '--log-level', 'WARN',
+            entry,
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as ex:
+            sys.stderr.write("pyinstaller refused to start: " + str(ex) + '\n')
+            return 1
+        if res.returncode != 0:
+            sys.stderr.write(res.stdout)
+            sys.stderr.write(res.stderr)
+            sys.stderr.write("pyinstaller could not finish the build.\n")
+            return res.returncode
+
+    ext = '.exe' if sys.platform.startswith('win') else ''
+    final = os.path.join(out_dir, out_name + ext)
+    if os.path.isfile(final):
+        sys.stdout.write('built: ' + final + '\n')
+    else:
+        sys.stdout.write('build finished but the binary is not at ' + final + '\n')
+    return 0
+
+
+def _print_actions_hint(crc_path: str) -> int:
+    msg = (
+        "to build native binaries for linux, windows and macos at the same time,\n"
+        "push a tag to your github repo:\n\n"
+        "    git tag v0.1.0 && git push origin v0.1.0\n\n"
+        "the workflow at .github/workflows/release.yml will run pyinstaller on\n"
+        "all three operating systems and attach the binaries to a github release.\n"
+        "the source file used will be: " + crc_path + "\n"
+    )
+    sys.stdout.write(msg)
+    return 0
+
+
+def build_command(crc_path: str, out_path: str, target: str,
+                  native: bool, actions: bool) -> int:
+    if actions:
+        return _print_actions_hint(crc_path)
+    if native:
+        return _build_native(crc_path, out_path)
+    return _build_portable(crc_path, out_path, target)
+
+
+def doctor_command() -> int:
+    """Show which build paths are available on this machine."""
+    import shutil
+
+    rows = []
+    rows.append(('python', sys.executable))
+    rows.append(('python version', '%d.%d.%d' % sys.version_info[:3]))
+    rows.append(('host target', _detect_host_target()))
+    rows.append(('zipapp (portable build)', 'present (stdlib)'))
+    pyi = shutil.which('pyinstaller')
+    rows.append(('pyinstaller (native build)', pyi if pyi else 'missing — pip install pyinstaller'))
+    wine = shutil.which('wine')
+    rows.append(('wine (used by some cross paths)', wine if wine else 'missing'))
+
+    name_w = max(len(r[0]) for r in rows)
+    for k, v in rows:
+        sys.stdout.write(k.ljust(name_w + 2) + str(v) + '\n')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog='corec', add_help=True)
     sub = parser.add_subparsers(dest='cmd')
-    p_run = sub.add_parser('run')
+
+    p_run = sub.add_parser('run', help='run a .crc file with the interpreter')
     p_run.add_argument('file')
-    p_emit = sub.add_parser('emit')
+
+    p_emit = sub.add_parser('emit', help='emit a json execution report (used by tooling)')
     p_emit.add_argument('file')
+
+    p_build = sub.add_parser(
+        'build',
+        help='package a .crc file into a single executable (portable .pyz by default)',
+    )
+    p_build.add_argument('file')
+    p_build.add_argument('-o', '--output', default=None,
+                         help='output path (default: <name>.pyz next to the source)')
+    p_build.add_argument('--target', default='host', choices=_TARGETS,
+                         help='target os for the wrapper script (linux/windows/macos/host)')
+    p_build.add_argument('--native', action='store_true',
+                         help='build a true native binary for the current os via pyinstaller')
+    p_build.add_argument('--portable', action='store_true',
+                         help='force portable .pyz (this is already the default)')
+    p_build.add_argument('--actions', action='store_true',
+                         help='print the github-actions cross-compile instructions and exit')
+
+    sub.add_parser('doctor', help='show which build paths are available on this machine')
+
     args = parser.parse_args()
     if args.cmd == 'run':
         return run_file(args.file)
     if args.cmd == 'emit':
         return emit_json(args.file)
+    if args.cmd == 'build':
+        if args.portable and args.native:
+            sys.stderr.write("--portable and --native cannot both be set.\n")
+            return 2
+        return build_command(
+            crc_path=args.file,
+            out_path=args.output,
+            target=args.target,
+            native=args.native,
+            actions=args.actions,
+        )
+    if args.cmd == 'doctor':
+        return doctor_command()
     parser.print_help()
     return 0
 
