@@ -1,0 +1,12 @@
+voice greet(name: echo) -> echo {
+    perhaps name == "" {
+        fade "i don't remember who you are."
+    }
+    fade "hello, " + name + "."
+}
+
+voice main() {
+    whisper(greet("mark"))
+    whisper(greet(""))
+    whisper(greet("anna"))
+}

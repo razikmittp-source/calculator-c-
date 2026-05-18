@@ -1,0 +1,104 @@
+name: release
+
+# the cross-compile path for the language.
+# push a tag like `v0.1.0` and this workflow runs pyinstaller on three
+# real runners (ubuntu, windows, macos) to produce native single-file
+# binaries, then attaches them all to one github release.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: ".crc file to build (path relative to repo root)"
+        required: true
+        default: "examples/here.crc"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux
+            runner: ubuntu-latest
+            asset_suffix: linux
+            ext: ""
+          - target: windows
+            runner: windows-latest
+            asset_suffix: windows
+            ext: ".exe"
+          - target: macos
+            runner: macos-latest
+            asset_suffix: macos
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install pyinstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: pick source file
+        id: src
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.source }}" ]; then
+            SRC="${{ github.event.inputs.source }}"
+          else
+            SRC="examples/here.crc"
+          fi
+          BASE="$(basename "$SRC" .crc)"
+          echo "src=$SRC"   >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: build native binary
+        shell: bash
+        run: |
+          python compiler/corec.py build "${{ steps.src.outputs.src }}" \
+            --native \
+            -o "dist/${{ steps.src.outputs.base }}-${{ matrix.asset_suffix }}"
+
+      - name: rename binary for upload
+        shell: bash
+        run: |
+          ls -la dist
+          mv "dist/${{ steps.src.outputs.base }}-${{ matrix.asset_suffix }}${{ matrix.ext }}" \
+             "dist/corec-${{ steps.src.outputs.base }}-${{ matrix.asset_suffix }}${{ matrix.ext }}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: corec-${{ steps.src.outputs.base }}-${{ matrix.asset_suffix }}
+          path: dist/corec-${{ steps.src.outputs.base }}-${{ matrix.asset_suffix }}${{ matrix.ext }}
+
+  release:
+    name: publish github release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: flatten artifacts
+        run: |
+          mkdir -p release-files
+          find artifacts -type f -exec cp {} release-files/ \;
+          ls -la release-files
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          generate_release_notes: true

@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  examples:
+    name: run examples on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+        exclude:
+          # one python version per non-linux runner is enough.
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.10"
+          - os: macos-latest
+            python-version: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: run every example
+        shell: bash
+        run: |
+          set -e
+          for f in examples/*.crc; do
+            echo "::group::run $f"
+            python3 compiler/corec.py run "$f"
+            echo "::endgroup::"
+          done
+      - name: portable build for the host
+        shell: bash
+        run: |
+          python3 compiler/corec.py build examples/here.crc -o here.pyz
+          ls -la here.pyz
+          python3 here.pyz

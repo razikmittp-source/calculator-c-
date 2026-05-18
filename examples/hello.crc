@@ -1,6 +1,0 @@
-// CoreC — Hello World
-fn main() {
-    let name = "World"
-    print("Hello, {name}!")
-    print("CoreC is blazingly fast 🚀")
-}

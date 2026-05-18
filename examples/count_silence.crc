@@ -1,0 +1,13 @@
+voice count_silence(seconds: memory) -> memory {
+    keep total: memory = 0
+    bury i in 0..seconds {
+        total = total + 1
+    }
+    fade total
+}
+
+voice main() {
+    keep night: memory = count_silence(60)
+    whisper("there were", night, "seconds of silence.")
+    whisper("i counted every one.")
+}
