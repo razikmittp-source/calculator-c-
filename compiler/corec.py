@@ -78,6 +78,7 @@ class TokenType(Enum):
     COMMA = auto()
     COLON = auto()
     ARROW = auto()
+    FATARROW = auto()
     DOT = auto()
     DOTDOT = auto()
     
@@ -201,6 +202,8 @@ class Lexer:
             elif ch == '=':
                 if self.match('='):
                     self.tokens.append(Token(TokenType.EQ, '==', start_line, start_col))
+                elif self.match('>'):
+                    self.tokens.append(Token(TokenType.FATARROW, '=>', start_line, start_col))
                 else:
                     self.tokens.append(Token(TokenType.ASSIGN, '=', start_line, start_col))
             elif ch == '!':
@@ -397,6 +400,21 @@ class RangeExpr(ASTNode):
     start: Optional[ASTNode] = None
     end: Optional[ASTNode] = None
 
+@dataclass
+class StructInit(ASTNode):
+    name: str = ""
+    fields: List[Tuple[str, ASTNode]] = field(default_factory=list)
+
+@dataclass
+class MatchArm(ASTNode):
+    pattern: Optional[ASTNode] = None  # None = default `_`
+    body: List[ASTNode] = field(default_factory=list)
+
+@dataclass
+class MatchStmt(ASTNode):
+    expr: Optional[ASTNode] = None
+    arms: List[MatchArm] = field(default_factory=list)
+
 
 # ============== PARSER ==============
 
@@ -511,10 +529,38 @@ class Parser:
             return self.parse_while()
         elif t.type == TokenType.RETURN:
             return self.parse_return()
+        elif t.type == TokenType.MATCH:
+            return self.parse_match()
         elif t.type == TokenType.IDENT:
             return self.parse_expr_or_assign()
         else:
             return self.parse_expr()
+    
+    def parse_match(self) -> MatchStmt:
+        self.advance()  # match
+        expr = self.parse_expr()
+        self.expect(TokenType.LBRACE)
+        self.skip_newlines()
+        arms = []
+        while self.peek().type != TokenType.RBRACE:
+            # Pattern: _ or expression
+            if self.peek().type == TokenType.IDENT and self.peek().value == '_':
+                self.advance()
+                pattern = None
+            else:
+                pattern = self.parse_expr()
+            self.expect(TokenType.FATARROW)
+            # Body: either single expr/stmt, or block
+            if self.peek().type == TokenType.LBRACE:
+                body = self.parse_block()
+            else:
+                body = [self.parse_statement()]
+            arms.append(MatchArm(pattern=pattern, body=body))
+            if self.peek().type == TokenType.COMMA:
+                self.advance()
+            self.skip_newlines()
+        self.expect(TokenType.RBRACE)
+        return MatchStmt(expr=expr, arms=arms)
     
     def parse_var_decl(self) -> VarDecl:
         self.advance()  # let
@@ -676,6 +722,28 @@ class Parser:
             return BoolLit(value=(t.type == TokenType.TRUE))
         elif t.type == TokenType.IDENT:
             self.advance()
+            # Check for struct literal: TypeName { field: value, ... }
+            if self.peek().type == TokenType.LBRACE:
+                save = self.pos
+                self.advance()  # {
+                self.skip_newlines()
+                if (self.peek().type == TokenType.IDENT and
+                    self.pos + 1 < len(self.tokens) and
+                    self.tokens[self.pos + 1].type == TokenType.COLON):
+                    # Looks like a struct literal
+                    fields = []
+                    while self.peek().type != TokenType.RBRACE:
+                        fname = self.expect(TokenType.IDENT).value
+                        self.expect(TokenType.COLON)
+                        fvalue = self.parse_expr()
+                        fields.append((fname, fvalue))
+                        if self.peek().type == TokenType.COMMA:
+                            self.advance()
+                        self.skip_newlines()
+                    self.expect(TokenType.RBRACE)
+                    return StructInit(name=t.value, fields=fields)
+                # Not a struct literal — rewind
+                self.pos = save
             return Identifier(name=t.value)
         elif t.type == TokenType.LBRACKET:
             return self.parse_array_lit()
@@ -719,12 +787,18 @@ class CodeGen:
         self.functions = {}  # name -> return_type
         self.includes = set()
         self.string_helpers_needed = False
+        self.struct_names = set()  # known struct type names
+        self.struct_fields = {}  # struct_name -> list of (field_name, field_type)
+        self._match_counter = 0
     
     def emit(self, line: str):
         self.output.append("    " * self.indent + line)
     
     def generate(self, program: Program) -> str:
-        # First pass: collect function signatures
+        # First pass: collect struct + function signatures
+        for s in program.structs:
+            self.struct_names.add(s.name)
+            self.struct_fields[s.name] = list(s.fields)
         for fn in program.functions:
             self.functions[fn.name] = fn.return_type
         
@@ -839,12 +913,61 @@ static char* _corec_concat(const char* a, const char* b) {
             self._gen_while(node)
         elif isinstance(node, ReturnStmt):
             self._gen_return(node)
+        elif isinstance(node, MatchStmt):
+            self._gen_match(node)
         elif isinstance(node, FuncCall):
             self._gen_func_call_stmt(node)
         else:
             # Expression statement
             expr = self._gen_expr(node)
             self.emit(f"{expr};")
+    
+    def _gen_match(self, node: MatchStmt):
+        self._match_counter += 1
+        var_name = f"_match_{self._match_counter}"
+        expr_str = self._gen_expr(node.expr)
+        expr_type = self._guess_type(node.expr)
+        c_type = self._type_to_c(expr_type)
+        is_string = (expr_type == "str" or c_type == "const char*")
+        
+        self.emit(f"{{")
+        self.indent += 1
+        self.emit(f"{c_type} {var_name} = {expr_str};")
+        
+        first = True
+        default_arm = None
+        for arm in node.arms:
+            if arm.pattern is None:
+                default_arm = arm
+                continue
+            pat = self._gen_expr(arm.pattern)
+            if is_string:
+                cond = f"strcmp({var_name}, {pat}) == 0"
+            else:
+                cond = f"{var_name} == {pat}"
+            self.emit(("if" if first else "else if") + f" ({cond}) {{")
+            self.indent += 1
+            for s in arm.body:
+                self._gen_stmt(s)
+            self.indent -= 1
+            self.emit("}")
+            first = False
+        
+        if default_arm is not None:
+            if first:
+                # No patterns, just default
+                for s in default_arm.body:
+                    self._gen_stmt(s)
+            else:
+                self.emit("else {")
+                self.indent += 1
+                for s in default_arm.body:
+                    self._gen_stmt(s)
+                self.indent -= 1
+                self.emit("}")
+        
+        self.indent -= 1
+        self.emit("}")
     
     def _gen_var_decl(self, node: VarDecl):
         if node.value:
@@ -858,6 +981,8 @@ static char* _corec_concat(const char* a, const char* b) {
                 self.vars[node.name + ".__len"] = str(n)
             elif isinstance(node.value, RangeExpr):
                 pass  # handled specially
+            elif isinstance(node.value, StructInit):
+                self.emit(f"{node.value.name} {node.name} = {val_expr};")
             else:
                 self.emit(f"{ctype} {node.name} = {val_expr};")
         else:
@@ -1056,6 +1181,12 @@ static char* _corec_concat(const char* a, const char* b) {
             return f"{arr}[{idx}]"
         elif isinstance(node, RangeExpr):
             return f"/* range */"
+        elif isinstance(node, StructInit):
+            field_str = ", ".join(
+                f".{fname} = {self._gen_expr(fval)}"
+                for fname, fval in node.fields
+            )
+            return f"(({node.name}){{{field_str}}})"
         
         return "/* unknown expr */"
     
@@ -1088,9 +1219,19 @@ static char* _corec_concat(const char* a, const char* b) {
         elif isinstance(node, FuncCall):
             return self.functions.get(node.name, "i32")
         elif isinstance(node, BinaryOp):
+            if node.op == '.':
+                # Field access on a struct: a.field -> type of field
+                left_type = self._guess_type(node.left)
+                if left_type in self.struct_fields and isinstance(node.right, Identifier):
+                    for fname, ftype in self.struct_fields[left_type]:
+                        if fname == node.right.name:
+                            return ftype
+                return "i32"
             return self._guess_type(node.left)
         elif isinstance(node, Identifier):
             return self.vars.get(node.name, "i32")
+        elif isinstance(node, StructInit):
+            return node.name
         return "i32"
     
     def _infer_array_elem_type(self, node: ArrayLit) -> str:
@@ -1102,10 +1243,30 @@ static char* _corec_concat(const char* a, const char* b) {
 
 # ============== CLI ==============
 
-def compile_file(source_path: str, output_path: str = None, run: bool = False, keep_c: bool = False):
+# Cross-compilation targets
+TARGETS = {
+    "linux":   {"cc": ["gcc"], "ext": "",     "extra": ["-lm"]},
+    "linux64": {"cc": ["gcc", "-m64"], "ext": "", "extra": ["-lm"]},
+    "linux32": {"cc": ["gcc", "-m32"], "ext": "", "extra": ["-lm"]},
+    "windows": {"cc": ["x86_64-w64-mingw32-gcc"], "ext": ".exe",
+                "extra": ["-static", "-static-libgcc", "-lm"]},
+    "win64":   {"cc": ["x86_64-w64-mingw32-gcc"], "ext": ".exe",
+                "extra": ["-static", "-static-libgcc", "-lm"]},
+    "win32":   {"cc": ["i686-w64-mingw32-gcc"], "ext": ".exe",
+                "extra": ["-static", "-static-libgcc", "-lm"]},
+}
+
+
+def compile_file(source_path: str, output_path: str = None, run: bool = False,
+                 keep_c: bool = False, target: str = "linux"):
     if not os.path.exists(source_path):
         print(f"Error: File '{source_path}' not found")
         sys.exit(1)
+    
+    if target not in TARGETS:
+        print(f"Error: unknown target '{target}'. Available: {', '.join(TARGETS)}")
+        sys.exit(1)
+    tinfo = TARGETS[target]
     
     with open(source_path, 'r') as f:
         source = f.read()
@@ -1113,7 +1274,11 @@ def compile_file(source_path: str, output_path: str = None, run: bool = False, k
     # Determine output name
     base = os.path.splitext(source_path)[0]
     if output_path is None:
-        output_path = base
+        output_path = base + tinfo["ext"]
+    elif tinfo["ext"] and not output_path.endswith(tinfo["ext"]):
+        # Add .exe for windows if user gave a name without it
+        if target.startswith("win"):
+            output_path = output_path + tinfo["ext"]
     c_path = base + ".c"
     
     try:
@@ -1133,23 +1298,27 @@ def compile_file(source_path: str, output_path: str = None, run: bool = False, k
         with open(c_path, 'w') as f:
             f.write(c_code)
         
-        # Compile with gcc
-        gcc_cmd = ["gcc", "-O2", "-o", output_path, c_path, "-lm"]
-        result = subprocess.run(gcc_cmd, capture_output=True, text=True)
+        # Compile with target compiler
+        cc_cmd = list(tinfo["cc"]) + ["-O2", "-o", output_path, c_path] + list(tinfo["extra"])
+        result = subprocess.run(cc_cmd, capture_output=True, text=True)
         
         if result.returncode != 0:
-            print(f"C compilation error:\n{result.stderr}")
+            print(f"C compilation error ({target}):\n{result.stderr}")
             print(f"\nGenerated C code saved to: {c_path}")
             sys.exit(1)
         
         if not keep_c:
             os.remove(c_path)
         
-        print(f"✓ Compiled: {source_path} → {output_path}")
+        print(f"✓ Compiled [{target}]: {source_path} → {output_path}")
         
         if run:
+            if target != "linux" and target != "linux64":
+                # Cannot natively execute non-host binaries
+                print(f"(skipped run: target '{target}' is not the host platform)")
+                return
             print(f"─── Running {output_path} ───")
-            os.execv(output_path, [output_path])
+            os.execv(os.path.abspath(output_path), [output_path])
     
     except SyntaxError as e:
         print(f"CoreC Syntax Error: {e}")
@@ -1175,36 +1344,64 @@ def emit_c(source_path: str):
     print(c_code)
 
 
+def _extract_target(argv):
+    """Pull --target <name> from argv and return (target_name, new_argv)."""
+    target = "linux"
+    out = list(argv)
+    if "--target" in out:
+        idx = out.index("--target")
+        if idx + 1 >= len(out):
+            print("Error: --target requires an argument")
+            sys.exit(1)
+        target = out[idx + 1]
+        del out[idx:idx + 2]
+    return target, out
+
+
 def main():
     if len(sys.argv) < 2:
         print("CoreC Compiler v0.1")
         print("Usage:")
-        print("  corec build <file.crc>         Compile to binary")
-        print("  corec run <file.crc>           Compile and run")
-        print("  corec emit <file.crc>          Show generated C code")
-        print("  corec build <file.crc> -o out  Compile with custom output name")
-        print("  corec build <file.crc> --keep-c  Keep generated .c file")
+        print("  corec build <file.crc>                  Compile to native Linux binary")
+        print("  corec build <file.crc> --target windows Compile to Windows .exe")
+        print("  corec run <file.crc>                    Compile and run")
+        print("  corec emit <file.crc>                   Show generated C code")
+        print("  corec build <file.crc> -o out           Compile with custom output name")
+        print("  corec build <file.crc> --keep-c         Keep generated .c file")
+        print("  corec targets                           List available targets")
+        print("")
+        print("Targets: " + ", ".join(TARGETS.keys()))
         sys.exit(0)
     
     cmd = sys.argv[1]
     
+    if cmd == "targets":
+        print("Available compilation targets:")
+        for name, info in TARGETS.items():
+            ext = info["ext"] or "(no ext)"
+            cc = info["cc"][0]
+            print(f"  {name:<10} {cc:<28} {ext}")
+        sys.exit(0)
+    
     if cmd == "build":
-        if len(sys.argv) < 3:
-            print("Usage: corec build <file.crc> [-o output] [--keep-c]")
+        target, argv = _extract_target(sys.argv)
+        if len(argv) < 3:
+            print("Usage: corec build <file.crc> [-o output] [--keep-c] [--target <name>]")
             sys.exit(1)
-        source = sys.argv[2]
+        source = argv[2]
         output = None
-        keep_c = "--keep-c" in sys.argv
-        if "-o" in sys.argv:
-            idx = sys.argv.index("-o")
-            output = sys.argv[idx + 1]
-        compile_file(source, output, run=False, keep_c=keep_c)
+        keep_c = "--keep-c" in argv
+        if "-o" in argv:
+            idx = argv.index("-o")
+            output = argv[idx + 1]
+        compile_file(source, output, run=False, keep_c=keep_c, target=target)
     
     elif cmd == "run":
-        if len(sys.argv) < 3:
+        target, argv = _extract_target(sys.argv)
+        if len(argv) < 3:
             print("Usage: corec run <file.crc>")
             sys.exit(1)
-        compile_file(sys.argv[2], run=True)
+        compile_file(argv[2], run=True, target=target)
     
     elif cmd == "emit":
         if len(sys.argv) < 3:

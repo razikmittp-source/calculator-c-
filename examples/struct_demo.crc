@@ -1,0 +1,39 @@
+// struct_demo.crc — using user-defined types in CoreC
+//
+// "Чтобы дать имена своим обитателям, я делал из них структуры.
+//  Структура — это договор. Имя, форма, поле. Машина их понимает."
+//                                                        — К.
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+struct Player {
+    id: i32
+    health: i32
+    pos: Point
+}
+
+fn distance_sq(a: Point, b: Point) -> i32 {
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    return dx * dx + dy * dy
+}
+
+fn main() {
+    let p1 = Point { x: 3, y: 4 }
+    let p2 = Point { x: 7, y: 1 }
+
+    let d = distance_sq(p1, p2)
+    print("p1 = ({p1.x}, {p1.y})")
+    print("p2 = ({p2.x}, {p2.y})")
+    print("distance^2 = {d}")
+
+    let hero = Player {
+        id: 1
+        health: 100
+        pos: Point { x: 0, y: 0 }
+    }
+    print("Player #{hero.id} hp={hero.health} at ({hero.pos.x}, {hero.pos.y})")
+}

@@ -9,6 +9,8 @@ examples/factorial
 examples/arrays
 examples/benchmark
 examples/guessing
+examples/struct_demo
+examples/match_demo
 build/
 dist/
 .vscode/
